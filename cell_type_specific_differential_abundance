@@ -1,0 +1,311 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+```{r}
+plot(cars)
+```
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(survival)
+library(coxphf)
+library(purrr)
+library(glmnet)
+library(readr)
+library(broom)
+library(survminer)
+library(stringr)
+library(tidyr)
+library(tibble)
+library(umap)
+library(limma)
+```
+```{r}
+merged_df <- readRDS("/work_space/files/proteomics/merged_df_with_valley_groups.rds")
+master_features <- read_csv("/work_space/files/Features/Run2_all/Manual_classes/master_features.csv")
+View(master_features)
+```
+
+
+#comparing proteomic abundace between prognosis groups at a cell type level'
+
+
+
+baseline_mean_cols <- grep(
+  "^baseline.*mean",
+  colnames(master_features),
+  value = TRUE,
+  ignore.case = TRUE
+)
+
+cat("Total baseline mean columns:", length(baseline_mean_cols), "\n\n")
+print(baseline_mean_cols)
+
+
+
+# Quick check
+cat("Rows:", nrow(merged_df), "\n")
+cat("Cols:", ncol(merged_df), "\n")
+cat("Prognosis groups:\n")
+print(table(merged_df$prognosis_group))
+
+### get column names
+# Check exact naming pattern for each cell type
+
+# Print ALL matches - no truncation
+nonie_cols <- grep("NonImmuneEpithelium", colnames(merged_df), 
+                   value = TRUE, ignore.case = TRUE)
+
+cat("Total columns:", length(nonie_cols), "\n\n")
+writeLines(nonie_cols)  # prints every single one, no truncation
+
+# Cancer cells
+cancer_cols <- grep("Mean\\.Cell.*NonImmuneEpithelium|NonImmuneEpithelium.*Mean\\.Cell", 
+                    colnames(merged_df), value = TRUE, ignore.case = TRUE)
+
+# Stromal cells
+stroma_cols <- grep("Mean\\.Cell.*NonImmuneStroma|NonImmuneStroma.*Mean\\.Cell", 
+                    colnames(merged_df), value = TRUE, ignore.case = TRUE)
+
+# Immune cells (all subtypes)
+immune_cols <- grep("Mean\\.Cell.*(cytT|helperT|regT|OtherImmune|\\bT\\b|\\bB\\b)|
+                    (cytT|helperT|regT|OtherImmune).*Mean\\.Cell", 
+                    colnames(merged_df), value = TRUE, ignore.case = TRUE)
+
+cat("Cancer cols:", length(cancer_cols), "\n"); writeLines(cancer_cols)
+cat("\nStroma cols:", length(stroma_cols), "\n"); writeLines(stroma_cols)
+cat("\nImmune cols:", length(immune_cols), "\n"); writeLines(immune_cols)
+
+
+
+######now cells are sorted out into groups... look at DE for each cell type
+# How many patients total have a prognosis group?
+cat("Total patients with prognosis group:\n")
+print(table(merged_df$prognosis_group, useNA = "always"))
+
+# How many have ANY immune column data (not all NA)?
+immune_data <- merged_df %>%
+  filter(prognosis_group %in% c("GOOD", "POOR")) %>%
+  dplyr::select(tma_id, prognosis_group, all_of(immune_cols))
+
+cat("\nTotal patients with prognosis group:", nrow(immune_data), "\n")
+
+# Count NAs per patient across immune cols
+immune_data$n_missing <- rowSums(is.na(immune_data[, immune_cols]))
+immune_data$n_present <- rowSums(!is.na(immune_data[, immune_cols]))
+
+cat("\nNA summary per patient:\n")
+print(summary(immune_data$n_missing))
+
+cat("\nPatients with ALL immune cols missing:", 
+    sum(immune_data$n_present == 0), "\n")
+
+cat("\nPatients with at least 1 immune col present:", 
+    sum(immune_data$n_present > 0), "\n")
+
+cat("\nPatients with ALL immune cols present (complete.cases):", 
+    sum(immune_data$n_missing == 0), "\n")
+
+# Filter immune cols to only mean, high, low
+immune_cols_filtered <- immune_cols[grepl("mean|high|low", 
+                                          immune_cols, 
+                                          ignore.case = TRUE)]
+
+cat("Total immune cols (all):", length(immune_cols), "\n")
+cat("After filtering to mean/high/low:", length(immune_cols_filtered), "\n")
+writeLines(immune_cols_filtered)
+
+cancer_cols_filtered <- cancer_cols[grepl("mean|high|low", 
+                                          cancer_cols, 
+                                          ignore.case = TRUE)]
+
+stroma_cols_filtered <- stroma_cols[grepl("mean|high|low", 
+                                          stroma_cols, 
+                                          ignore.case = TRUE)]
+
+cat("Cancer cols (mean/high/low):", length(cancer_cols_filtered), "\n")
+cat("Stroma cols (mean/high/low):", length(stroma_cols_filtered), "\n")
+
+
+# Patients with prognosis group
+immune_check <- merged_df %>%
+  filter(prognosis_group %in% c("GOOD", "POOR")) %>%
+  dplyr::select(tma_id, prognosis_group, all_of(immune_cols_filtered))
+
+total_immune_cols <- length(immune_cols_filtered)
+
+# Count present (non-NA) columns per patient
+immune_check$n_present <- rowSums(!is.na(immune_check[, immune_cols_filtered]))
+immune_check$pct_present <- immune_check$n_present / total_immune_cols * 100
+
+# Summary
+cat("Total immune cols:", total_immune_cols, "\n")
+cat("Total patients:", nrow(immune_check), "\n\n")
+
+cat("Patients with >50% immune cols present:", 
+    sum(immune_check$pct_present > 50), "\n")
+
+cat("Patients with >75% immune cols present:", 
+    sum(immune_check$pct_present > 75), "\n")
+
+cat("Patients with 100% complete:", 
+    sum(immune_check$pct_present == 100), "\n")
+
+# Distribution
+hist(immune_check$pct_present, 
+     breaks = 20,
+     main = "% Immune columns present per patient",
+     xlab = "% columns present")
+
+
+
+#####Immune cells will need to be done individually
+
+
+#cancer and stroma first
+library(limma)
+library(tibble)
+library(dplyr)
+
+# Check what rownames look like BEFORE cleaning in the function
+# Run this outside the function on your cancer cols
+test_mat <- t(as.matrix(
+  merged_df[1:5, cancer_cols_filtered]
+))
+
+cat("Raw rownames (first 10):\n")
+writeLines(rownames(test_mat)[1:10])
+
+# -------------------------------------------------------
+# LIMMA DE: GOOD vs POOR — Cancer and Stroma cells
+# -------------------------------------------------------
+
+run_de <- function(feature_cols, celltype_name) {
+  
+  cat("\n========================================\n")
+  cat("Cell type:", celltype_name, "\n")
+  
+  # Subset to GOOD/POOR patients with these columns
+  de_df <- merged_df %>%
+    filter(prognosis_group %in% c("GOOD", "POOR")) %>%
+    dplyr::select(tma_id, prognosis_group, all_of(feature_cols)) %>%
+    filter(complete.cases(.))
+  
+  cat("Patients:", nrow(de_df), "| Markers:", length(feature_cols), "\n")
+  
+  # Expression matrix: markers x patients
+  expr_mat <- t(as.matrix(de_df[, feature_cols]))
+  
+  # Clean marker names
+  rownames(expr_mat) <- feature_cols %>%
+  str_remove("^.*Mean\\.Cell\\.")
+  # Design: POOR = reference, GOOD = effect
+  group_factor <- factor(de_df$prognosis_group, levels = c("POOR", "GOOD"))
+  design <- model.matrix(~ group_factor)
+  
+  fit <- lmFit(expr_mat, design)
+  fit <- eBayes(fit)
+  
+  topTable(fit, coef = "group_factorGOOD", number = Inf, sort.by = "P") %>%
+    as.data.frame() %>%
+    rownames_to_column("marker") %>%
+    mutate(
+      cell_type   = celltype_name,
+      enriched_in = case_when(
+        logFC > 0 ~ "GOOD prognosis",
+        logFC < 0 ~ "POOR prognosis"
+      )
+    )
+}
+
+# -------------------------------------------------------
+# RUN
+# -------------------------------------------------------
+
+de_cancer <- run_de(cancer_cols_filtered, "Cancer")
+de_stroma <- run_de(stroma_cols_filtered, "Stroma")
+
+# -------------------------------------------------------
+# COMBINE AND SAVE
+# -------------------------------------------------------
+
+de_cancer_stroma <- bind_rows(de_cancer, de_stroma)
+
+write.csv(de_cancer_stroma,
+          "de_cancer_stroma_GOOD_vs_POOR.csv",
+          row.names = FALSE)
+
+# -------------------------------------------------------
+# RESULTS SUMMARY
+# -------------------------------------------------------
+
+# Count significant hits per cell type
+de_cancer_stroma %>%
+  filter(adj.P.Val < 0.05) %>%
+  count(cell_type, enriched_in) %>%
+  tidyr::pivot_wider(names_from = enriched_in, 
+                     values_from = n, 
+                     values_fill = 0) %>%
+  print()
+
+# Top 10 per cell type
+de_cancer_stroma %>%
+  filter(adj.P.Val < 0.05) %>%
+  group_by(cell_type) %>%
+  slice_min(adj.P.Val, n = 10) %>%
+  dplyr::select(cell_type, marker, logFC, adj.P.Val, enriched_in) %>%
+  print(n = Inf)
+
+
+# -------------------------------------------------------
+# EXTRACT: Top proteins higher in GOOD prognosis
+# -------------------------------------------------------
+
+good_cancer <- de_cancer %>%
+  filter(adj.P.Val < 0.05, logFC > 0) %>%
+  arrange(desc(logFC)) %>%
+  dplyr::select(marker, logFC, adj.P.Val, AveExpr)
+
+good_stroma <- de_stroma %>%
+  filter(adj.P.Val < 0.05, logFC > 0) %>%
+  arrange(desc(logFC)) %>%
+  dplyr::select(marker, logFC, adj.P.Val, AveExpr)
+
+# -------------------------------------------------------
+# EXTRACT: Top proteins higher in POOR prognosis
+# -------------------------------------------------------
+
+poor_cancer <- de_cancer %>%
+  filter(adj.P.Val < 0.05, logFC < 0) %>%
+  arrange(logFC) %>%  
+  dplyr::select(marker, logFC, adj.P.Val, AveExpr)
+
+poor_stroma <- de_stroma %>%
+  filter(adj.P.Val < 0.05, logFC < 0) %>%
+  arrange(logFC) %>%
+  dplyr::select(marker, logFC, adj.P.Val, AveExpr)
+
+# -------------------------------------------------------
+# PRINT
+# -------------------------------------------------------
+
+cat("=== CANCER CELLS: Higher in GOOD prognosis ===\n"); print(good_cancer)
+cat("\n=== CANCER CELLS: Higher in POOR prognosis ===\n"); print(poor_cancer)
+cat("\n=== STROMA: Higher in GOOD prognosis ===\n");      print(good_stroma)
+cat("\n=== STROMA: Higher in POOR prognosis ===\n");      print(poor_stroma)
+
+# -------------------------------------------------------
+# SAVE
+# -------------------------------------------------------
+
+#write.csv(good_cancer, "good_prognosis_proteins_cancer_cells.csv", row.names = FALSE)
+#write.csv(poor_cancer, "poor_prognosis_proteins_cancer_cells.csv", row.names = FALSE)
+#write.csv(good_stroma, "good_prognosis_proteins_stroma.csv",       row.names = FALSE)
+#write.csv(poor_stroma, "poor_prognosis_proteins_stroma.csv",       row.names = FALSE)```{r}
