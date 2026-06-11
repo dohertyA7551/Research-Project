@@ -1,0 +1,170 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+```{r}
+plot(cars)
+```
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Ctrl+Alt+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Ctrl+Shift+K* to preview the HTML file).
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(survival)
+library(coxphf)
+library(purrr)
+library(glmnet)
+library(readr)
+library(broom)
+library(survminer)
+library(stringr)
+library(tidyr)
+library(tibble)
+library(umap)
+library(limma)
+```
+
+```{r}
+merged_df <-readRDS(file ="RCSI_Taxonomy_clin_prot_merged_df.rds")
+mc_event_both <-readRDS(file ="mc_event_both.rds")
+mc_no_event_both <-readRDS(file ="mc_noevent_both.rds")
+```
+
+```{r}
+# All event / no-event MCs must be columns in merged_df
+stopifnot(all(mc_event_both    %in% colnames(merged_df)))
+stopifnot(all(mc_no_event_both %in% colnames(merged_df)))
+merged_df_scores <- merged_df %>%
+  mutate(
+    # summed abundance over bad (event) metaclusters
+    bad_abund  = rowSums(across(all_of(mc_event_both)),    na.rm = TRUE),
+    # summed abundance over good (no-event) metaclusters
+    good_abund = rowSums(across(all_of(mc_no_event_both)), na.rm = TRUE)
+  ) %>%
+  mutate(
+    # raw score: higher = more bad vs good
+    score_raw = bad_abund - good_abund
+  )
+
+ggplot(merged_df_scores, aes(x = score_raw)) +
+  geom_histogram(bins = 30, colour = "black", fill = "steelblue") +
+  theme_minimal() +
+  labs(
+    x = "Raw prognosis score (bad - good MC abundance)",
+    y = "Number of patients"
+  )
+
+```
+```{r}
+ggplot(merged_df_scores, aes(x = score_logratio)) +
+  geom_histogram(bins = 30, colour = "black", fill = "tomato") +
+  theme_minimal() +
+  labs(
+    x = "Prognosis score (log bad/good MC abundance)",
+    y = "Number of patients"
+  )
+
+```
+```{r}
+grep("adjuv", colnames(merged_df), ignore.case = TRUE, value = TRUE)
+table(merged_df$has_adjuvant_chemotherapy, useNA = "ifany")
+
+merged_df_adjuvent <-merged_df %>%
+  filter(has_adjuvant_chemotherapy =="yes")
+leiden_cols <- colnames(merged_df)[grepl("abundance_metacluster_leiden", colnames(merged_df))]
+cat("Number of metacluster abundance columns:", length(leiden_cols), "\n")
+merged_df_dfs <- merged_df_adjuvent %>%
+  filter(
+    !is.na(dfs_months),
+    dfs_months > 0,
+    !is.na(dfs_event)
+  )
+length(merged_df_dfs$dfs_months)
+```
+```{r}
+merged_df_dfs <- merged_df_dfs %>%
+  mutate(
+    dfs_group_adjuv = factor(
+      dfs_event,
+      levels = c(0, 1),
+      labels = c("No DFS event", "DFS event")
+    )
+  )
+
+table(merged_df_dfs$dfs_group_adjuv, useNA = "ifany")
+mc_prob_stats_adjuvent <- map_dfr(leiden_cols, function(col) {
+  p <- merged_df_dfs[[col]]
+
+  p_event   <- p[merged_df_dfs$dfs_group_adjuv == "DFS event"]
+  p_noevent <- p[merged_df_dfs$dfs_group_adjuv == "No DFS event"]
+
+  p_event   <- p_event[!is.na(p_event)]
+  p_noevent <- p_noevent[!is.na(p_noevent)]
+
+  if (length(p_event) == 0 || length(p_noevent) == 0) {
+    return(tibble(
+      metacluster          = col,
+      mean_prob_event      = NA_real_,
+      mean_prob_noevent    = NA_real_,
+      median_prob_event    = NA_real_,
+      median_prob_noevent  = NA_real_,
+      p_value              = NA_real_
+    ))
+  }
+
+  wt <- wilcox.test(p_event, p_noevent, exact = FALSE)
+
+  tibble(
+    metacluster          = col,
+    mean_prob_event      = mean(p_event),
+    mean_prob_noevent    = mean(p_noevent),
+    median_prob_event    = median(p_event),
+    median_prob_noevent  = median(p_noevent),
+    p_value              = wt$p.value
+  )
+})
+
+mc_prob_stats_adjuvent <- mc_prob_stats_adjuvent %>%
+  arrange(p_value)
+
+mc_prob_stats_adjuvent
+
+```
+```{r}
+mc_prob_stats_adjuvent_event_p_sorted <- mc_prob_stats_adjuvent %>%
+  arrange(desc(mean_prob_event), p_value)
+
+head(mc_prob_stats_adjuvent_event_p_sorted)
+
+
+
+mc_prob_stats_adjuvent <- mc_prob_stats_adjuvent %>%
+  mutate(
+    diff_event_minus_noevent = mean_prob_event - mean_prob_noevent
+  )
+event_enriched_adjuvent <- mc_prob_stats_adjuvent %>%
+  arrange(desc(diff_event_minus_noevent))
+
+head(event_enriched_adjuvent, 10)
+```
+
+```{r}
+mc_prob_stats_adjuvent_noevent_p_sorted <- mc_prob_stats_adjuvent %>%
+  arrange(desc(mean_prob_noevent), p_value)
+head(mc_prob_stats_adjuvent_event_p_sorted)
+noevent_enriched_adjuvent <- mc_prob_stats_adjuvent %>%
+  arrange(diff_event_minus_noevent)
+
+head(noevent_enriched_adjuvent, 10)
+```
+
