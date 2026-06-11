@@ -1,0 +1,362 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+```{r}
+
+```
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+```{r}
+plot(cars)
+```
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Ctrl+Alt+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Ctrl+Shift+K* to preview the HTML file).
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.  
+```{r}
+```
+
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(survival)
+library(coxphf)
+library(purrr)
+library(glmnet)
+library(readr)
+library(broom)
+library(survminer)
+library(stringr)
+library(tidyr)
+library(tibble)
+library(umap)
+library(limma)
+
+```
+```{r}
+clin_a<- read.csv("/work_space/files/spatial/ColonRO1_2020_RCSI_clinical.csv")
+merged_df <-readRDS(file ="RCSI_Taxonomy_clin_prot_merged_df.rds")
+```
+
+
+```{r}
+patients_G <-merged_df[grepl("^G", merged_df$patient_id), ]
+```
+
+```{r}
+merged_df_dfs <- patients_G %>%
+  filter(
+    !is.na(dfs_months),
+    dfs_months > 0,
+    !is.na(dfs_event)
+  )
+length(merged_df_dfs$dfs_months)
+```
+
+
+```{r}
+merged_df_dss <- patients_G %>%
+  filter(
+    !is.na(dss_months),
+    dss_months > 0,
+    !is.na(dss_event)
+  )
+  
+```
+
+```{r}
+# Get all leiden abundance columns
+leiden_cols <- colnames(merged_df)[grepl("abundance_metacluster_leiden", colnames(merged_df))]
+cat("Number of metacluster abundance columns:", length(leiden_cols), "\n")
+
+zero_mc <- sapply(merged_df_dfs[, leiden_cols], function(col) all(col == 0))
+zero_mc_names <- names(zero_mc[zero_mc])
+print(zero_mc_names)
+
+```
+```{r}
+leiden_cols <-setdiff(leiden_cols ,zero_mc_names)
+print(leiden_cols)
+```
+
+
+```{r}
+#LASSO COX FUNCTION
+
+run_lasso_cox <- function(data, time_col, event_col, endpoint_name) {
+  
+  cat("\n========================================\n")
+  cat("ENDPOINT:", endpoint_name, "| N =", nrow(data), "\n")
+  
+
+
+
+
+  # Design matrix and survival response
+  X <- as.matrix(data[, leiden_cols])
+  
+  
+  y <- Surv(data[[time_col]], data[[event_col]])
+  
+  set.seed(42)
+  cv_fit <- cv.glmnet(
+    X, y,
+    family   = "cox",
+```
+
+
+```{r}
+alpha    =  1,
+    nfolds   = 10,
+    cox.ties = "efron"
+  )
+  
+  cat("Lambda min:", round(cv_fit$lambda.min, 5), "\n")
+  cat("Lambda 1se:", round(cv_fit$lambda.1se, 5), "\n")
+  
+  coefs    <- coef(cv_fit, s = "lambda.min")
+  selected <- data.frame(
+    metacluster = rownames(coefs),
+    coefficient = as.numeric(coefs)
+  ) %>%
+    filter(coefficient != 0) %>%
+    mutate(
+      HR        = round(exp(coefficient), 3),
+      direction = ifelse(coefficient > 0, "POOR prognosis", "GOOD prognosis")
+    ) %>%
+    arrange(desc(abs(coefficient)))
+  
+  cat("\nSelected metaclusters at lambda.min (n =", nrow(selected), "):\n")
+  print(selected)
+  
+  plot(cv_fit, main = paste("LASSO CV -", endpoint_name))
+  
+  return(list(cv_fit = cv_fit, selected = selected))
+}
+
+
+dfs_lasso <-run_lasso_cox(
+  data = merged_df_dfs,
+  time_col = "dfs_months",
+  event_col ="dfs_event",
+  endpoint_name ="DFS"
+)
+
+
+```
+
+
+
+```{r}
+
+
+# Build formula: Surv ~ all metaclusters
+cox_formula <- as.formula(
+  paste(
+    "Surv(dfs_months, dfs_event) ~",
+    paste(leiden_cols, collapse = " + ")
+  )
+)
+
+full_cox <- coxph(cox_formula, data = merged_df_dfs)
+summary(full_cox)
+```
+```{r}
+set.seed(123)
+B <- 200  # number of bootstrap samples (adjust as time allows)
+
+boot_coefs <- replicate(B, {
+  # resample patients with replacement
+  idx <- sample(seq_len(nrow(merged_df_dfs)), replace = TRUE)
+  boot_data <- merged_df_dfs[idx, ]
+
+  fit <- coxph(cox_formula, data = boot_data)
+  coef(fit)  # named vector of coefficients
+})
+
+# boot_coefs is a matrix: rows = metaclusters, cols = bootstrap reps
+boot_coefs <- t(boot_coefs)  # make rows = reps, cols = metaclusters
+```
+```{r}
+boot_summary <- apply(boot_coefs, 2, function(b) {
+  b <- b[is.finite(b)]  # drop any NA/Inf if a fit failed
+  c(
+    mean   = mean(b),
+    sd     = sd(b),
+    q2.5   = quantile(b, 0.025),
+    q97.5  = quantile(b, 0.975),
+    pos_pr = mean(b > 0),
+    neg_pr = mean(b < 0)
+  )
+})
+boot_summary <- t(boot_summary)
+boot_summary
+```
+```{r}
+names(boot_df_high)
+
+# Turn boot_summary into a data frame and add HR
+boot_df <- as.data.frame(boot_summary)
+boot_df$metacluster <- rownames(boot_summary)
+
+# Mean HR per cluster
+boot_df$HR_mean <- exp(boot_df$mean)
+
+# Sort by HR (descending) to see highest HRs
+boot_df_high <- boot_df[order(-boot_df$HR_mean), ]
+
+# Sort by HR (ascending) to see lowest HRs
+boot_df_low  <- boot_df[order(boot_df$HR_mean), ]
+
+# Look at top 5 highest-HR clusters
+head(
+  boot_df_high[, c("metacluster", "HR_mean", "q2.5.2.5%", "q97.5.97.5%", "pos_pr")],
+  10
+)
+
+# Look at top 5 lowest-HR clusters (protective)
+head(
+  boot_df_low[, c("metacluster", "HR_mean", "q2.5.2.5%", "q97.5.97.5%", "pos_pr")],
+  10
+)
+top10 <- head(boot_df_high, 10)
+bot10 <- head(boot_df_low, 10)
+
+intersect(top10$metacluster, bot10$metacluster)
+
+```
+```{r}
+# 1. Filter (optionally) to clusters whose CI excludes 0 on log-HR scale
+#    i.e. both bounds > 0 or both < 0
+stable_idx <- which(
+  (boot_df$`q2.5.2.5%` > 0 & boot_df$`q97.5.97.5%` > 0) |
+  (boot_df$`q2.5.2.5%` < 0 & boot_df$`q97.5.97.5%` < 0)
+)
+stable_df <- boot_df[stable_idx, ]
+
+# 2. Sort by HR_mean
+stable_high <- stable_df[order(-stable_df$HR_mean), ]
+stable_low  <- stable_df[order( stable_df$HR_mean), ]
+
+# 3. Get top 5 highest-HR clusters
+top5 <- head(stable_high, 5)
+
+# 4. For the lowest-HR list, exclude any clusters already in top5
+remaining <- stable_low[!(stable_low$metacluster %in% top5$metacluster), ]
+
+bot5 <- head(remaining, 5)
+
+# 5. Inspect
+top5[, c("metacluster", "HR_mean", "q2.5.2.5%", "q97.5.97.5%", "pos_pr")]
+bot5[, c("metacluster", "HR_mean", "q2.5.2.5%", "q97.5.97.5%", "pos_pr")]
+
+nrow(boot_df)
+sum(boot_df$`q2.5.2.5%` > 0 & boot_df$`q97.5.97.5%` > 0)
+sum(boot_df$`q2.5.2.5%` < 0 & boot_df$`q97.5.97.5%` < 0)
+
+# Sign-stable if coefficient is positive >= 0.8 of the time, or negative >= 0.8
+stable_idx <- which(
+  boot_df$pos_pr >= 0.8 | boot_df$neg_pr >= 0.8
+)
+stable_df <- boot_df[stable_idx, ]
+nrow(stable_df)
+
+# Sort by HR_mean within stable_df
+stable_high <- stable_df[order(-stable_df$HR_mean), ]
+stable_low  <- stable_df[order( stable_df$HR_mean), ]
+
+# Top 5 highest HR
+top5 <- head(stable_high, 5)
+
+# Exclude these from the low list
+remaining <- stable_low[!(stable_low$metacluster %in% top5$metacluster), ]
+
+# Bottom 5 lowest HR from remaining
+bot5 <- head(remaining, 5)
+
+top5[, c("metacluster", "HR_mean", "q2.5.2.5%", "q97.5.97.5%", "pos_pr")]
+bot5[, c("metacluster", "HR_mean", "q2.5.2.5%", "q97.5.97.5%", "pos_pr")]
+saveRDS(top5, file = "dfs_top5_metaclusters.rds")
+saveRDS(bot5, file = "dfs_bot5_metaclusters.rds")
+```
+```{r}
+df_compare <- merged_df_dfs %>%
+  mutate(
+    dfs_group = factor(
+      dfs_event,
+      levels=c(0,1),
+      labels =c("No DFS event", "DFS event")
+    )
+  )
+
+
+table(df_compare$dfs_group, useNA = "ifany")
+# should show 97 No_DFS_event, 24 DFS_event (as you saw)
+
+
+
+mc_prob_stats <- map_dfr(leiden_cols, function(col) {
+  p <- df_compare[[col]]  # probabilities for this cluster
+
+  # Split by DFS group (note the spaces!)
+  p_event   <- p[df_compare$dfs_group == "DFS event"]
+  p_noevent <- p[df_compare$dfs_group == "No DFS event"]
+
+  # Remove NAs
+  p_event   <- p_event[!is.na(p_event)]
+  p_noevent <- p_noevent[!is.na(p_noevent)]
+
+  # If either group has no data, return NA row for this cluster
+  if (length(p_event) == 0 || length(p_noevent) == 0) {
+    return(tibble(
+      metacluster          = col,
+      mean_prob_event      = NA_real_,
+      mean_prob_noevent    = NA_real_,
+      median_prob_event    = NA_real_,
+      median_prob_noevent  = NA_real_,
+      p_value              = NA_real_
+    ))
+  }
+
+  # Non-parametric comparison of distributions
+  wt <- wilcox.test(p_event, p_noevent, exact = FALSE)
+
+  tibble(
+    metacluster          = col,
+    mean_prob_event      = mean(p_event),
+    mean_prob_noevent    = mean(p_noevent),
+    median_prob_event    = median(p_event),
+    median_prob_noevent  = median(p_noevent),
+    p_value              = wt$p.value
+  )
+})
+
+mc_prob_stats <- mc_prob_stats %>% arrange(p_value)
+mc_prob_stats
+```
+
+
+```{r}
+event_clusters <- mc_prob_stats %>%
+  filter(mean_prob_event > mean_prob_noevent) %>%
+  arrange(p_value)
+
+noevent_clusters <- mc_prob_stats %>%
+  filter(mean_prob_noevent > mean_prob_event) %>%
+  arrange(p_value)
+head(event_clusters)
+head(noevent_clusters)
+saveRDS(event_clusters, file="RCS_event_clusters.rds")
+saveRDS(noevent_clusters, file ="RCSI_no_event_clusters.rds")
+```
+
+
+```{r}
