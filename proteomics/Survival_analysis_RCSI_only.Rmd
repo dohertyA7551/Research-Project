@@ -168,7 +168,20 @@ cox_formula <- as.formula(
 
 full_cox <- coxph(cox_formula, data = merged_df_dfs)
 summary(full_cox)
+
+
+
+
+
+
+
 ```
+
+
+
+
+
+
 ```{r}
 set.seed(123)
 B <- 200  # number of bootstrap samples (adjust as time allows)
@@ -360,3 +373,60 @@ saveRDS(noevent_clusters, file ="RCSI_no_event_clusters.rds")
 
 
 ```{r}
+event_clusters <- readRDS("RCS_event_clusters.rds")
+noevent_clusters <-readRDS("RCSI_no_event_clusters.rds")
+head(event_clusters)
+head (noevent_clusters)
+```
+```{r}
+
+event_clusters_sorted <-event_clusters[order(-event_clusters$mean_prob_event),]
+noevent_clusters_sorted <- noevent_clusters[order(-noevent_clusters$mean_prob_noevent),]
+print(event_clusters_sorted)
+print(noevent_clusters_sorted)
+
+```
+```{r}
+mc_ids_goodprog <-sub(".*(MC_\\d+).*","\\1", noevent_clusters_sorted$metacluster)
+mc_ids_poorprog <-sub(".*(MC_\\d+).*","\\1", event_clusters_sorted$metacluster)
+# vectors of column names that exist in df_compare
+bad_cols  <- event_clusters_sorted$metacluster
+good_cols <- noevent_clusters_sorted$metacluster
+
+# sanity check: ensure they are actually columns in df_compare
+stopifnot(all(bad_cols  %in% colnames(df_compare)))
+stopifnot(all(good_cols %in% colnames(df_compare)))
+```
+```{r}
+
+# per-patient total bad/good abundance
+bad_abund  <- rowSums(df_compare[, bad_cols,  drop = FALSE], na.rm = TRUE)
+good_abund <- rowSums(df_compare[, good_cols, drop = FALSE], na.rm = TRUE)
+
+patient_scores <- data.frame(
+  patient_id = rownames(df_compare),
+  good_abund = good_abund,
+  bad_abund  = bad_abund
+)
+
+# RAW prognosis score (no log)
+patient_scores$score_raw <- patient_scores$bad_abund - patient_scores$good_abund
+
+ggplot(patient_scores, aes(x = score_raw)) +
+  geom_histogram(bins = 30, colour = "black", fill = "steelblue") +
+  theme_minimal() +
+  labs(
+    x = "Raw prognosis score (bad - good MC abundance)",
+    y = "Number of patients"
+  )
+```
+
+```{r}
+eps <- 1e-6
+
+patient_scores$score_logratio <- log(patient_scores$bad_abund + eps) -
+                                 log(patient_scores$good_abund + eps)
+
+
+```
+
