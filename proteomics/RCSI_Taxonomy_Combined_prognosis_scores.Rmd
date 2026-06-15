@@ -36,8 +36,132 @@ library(limma)
 
 ```{r}
 merged_df <-readRDS(file ="RCSI_Taxonomy_clin_prot_merged_df.rds")
-mc_event_both <-readRDS(file ="mc_event_both.rds")
+mc_event_both <-readRDS(file ="mc_event_both.rds") #both means taxonomy and rcsi
 mc_no_event_both <-readRDS(file ="mc_noevent_both.rds")
+```
+
+
+```{r}
+#Attempting to assess how much dataset origin confounds my results
+merged_df$dataset_group <- ifelse(substr(merged_df$patient_id, 1,1) =="G", "G", "P")
+table(merged_df$dataset_group)
+head(merged_df[, c("patient_id", "dataset_group")])
+
+# Get all leiden abundance columns
+leiden_cols <- colnames(merged_df)[grepl("abundance_metacluster_leiden", colnames(merged_df))]
+cat("Number of metacluster abundance columns:", length(leiden_cols), "\n")
+
+zero_mc <- sapply(merged_df_dfs[, leiden_cols], function(col) all(col == 0))
+zero_mc_names <- names(zero_mc[zero_mc])
+print(zero_mc_names)
+leiden_cols <-setdiff(leiden_cols ,zero_mc_names)
+
+
+
+
+```
+```{r}
+###just want to check survival between the two datasets
+# Log-rank test
+survdiff(Surv(dfs_months, dfs_event) ~ dataset_group, data = merged_df)
+# Fit KM
+km_fit <- survfit(Surv(dfs_months, dfs_event) ~ dataset_group, data = merged_df)
+
+# Plot
+ggsurvplot(
+  km_fit,
+  data = merged_df,
+  pval = TRUE,
+  conf.int = TRUE,
+  risk.table = TRUE,
+  palette = c("#E7B800", "#2E9FDF"),
+  legend.labs = c("G", "P"),
+  xlab = "Time (months)",
+  ylab = "DFS Probability",
+  title = "Disease-Free Survival by Dataset Group (G vs P)"
+)
+```
+```{r}
+### two approches to invesitage surivial
+# Cluster patients by their full probability profile
+set.seed(42)
+prob_mat <- as.matrix(merged_df[, leiden_cols])
+km_profiles <- kmeans(prob_mat, centers = 2)
+
+
+merged_df$profile_group <- factor(km_profiles$cluster)
+
+# KM plot by profile
+km_fit2 <- survfit(Surv(dfs_months, dfs_event) ~ profile_group, data = merged_df)
+ggsurvplot(km_fit2, data = merged_df, pval = TRUE, risk.table = TRUE,
+           title = "DFS by cluster probability profile group")
+
+
+
+###now kind of need to know which clusters are responsible
+# From your earlier kmeans result with k=2
+km_profiles <- kmeans(prob_mat, centers = 2)
+
+# Centroids: rows = profile groups, cols = leiden clusters
+
+centroids <- as.data.frame(km_profiles$centers)
+colnames(centroids) <- leiden_cols
+centroids$profile_group <- paste0("Group", 1:2)
+
+centroids <- as.data.frame(km_profiles$centers)
+colnames(centroids) <- leiden_cols
+
+top_n <- 10
+
+for (g in 1:2) {
+  cat("\n--- Profile Group", g, "---\n")
+  row_vec <- as.numeric(centroids[g, ])       # convert row to numeric vector
+  names(row_vec) <- leiden_cols               # re-attach names
+  sorted <- sort(row_vec, decreasing = TRUE)  # now sort works fine
+  print(head(sorted, top_n))
+}
+
+
+
+```
+```{r}
+cent_long <- centroids %>%
+  mutate(profile_group = paste0("Group", 1:2)) %>%
+  pivot_longer(cols = leiden_cols,
+               names_to = "leiden_cluster",
+               values_to = "mean_prob")
+
+# Keep only clusters where at least one group has mean_prob > threshold
+top_clusters <- cent_long %>%
+  group_by(leiden_cluster) %>%
+  summarise(max_prob = max(mean_prob)) %>%
+  arrange(desc(max_prob)) %>%
+  slice_head(n = 15) %>%
+  pull(leiden_cluster)
+
+cent_long %>%
+  filter(leiden_cluster %in% top_clusters) %>%
+  ggplot(aes(x = leiden_cluster, y = profile_group, fill = mean_prob)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(mean_prob, 2)), size = 3) +
+  scale_fill_gradient(low = "white", high = "#2E9FDF") +
+  labs(title = "Top clusters by profile group",
+       x = "Cluster", y = "Profile Group", fill = "Mean Prob") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+diff_df <- data.frame(
+  leiden_cluster = leiden_cols,
+  group1_prob    = as.numeric(centroids[1, ]),
+  group2_prob    = as.numeric(centroids[2, ])
+)
+
+diff_df$difference <- abs(diff_df$group1_prob - diff_df$group2_prob)
+
+# Top discriminating clusters
+diff_df %>%
+  arrange(desc(difference)) %>%
+  head(15)
 ```
 
 ```{r}
