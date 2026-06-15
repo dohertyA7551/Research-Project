@@ -1,0 +1,135 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(survival)
+library(coxphf)
+library(purrr)
+library(glmnet)
+library(readr)
+library(broom)
+library(survminer)
+library(stringr)
+library(tidyr)
+library(tibble)
+library(umap)
+library(limma)
+```
+
+
+```{r}
+merged_df <-readRDS(file ="RCSI_Taxonomy_clin_prot_merged_df.rds")
+prognostic_groups <- readRDS( file = "profile_group_assignments_fn.rds")
+```
+
+```{r}
+baseline_mean_cols <- grep(
+  "^baseline.*mean",
+  colnames(merged_df),
+  value = TRUE,
+  ignore.case = TRUE
+)
+
+cancer_cols  <- grep("_mean_NonImmuneEpithelium$", colnames(merged_df), value = TRUE, ignore.case = TRUE)
+stroma_cols  <- grep("_mean_NonImmuneStroma$",     colnames(merged_df), value = TRUE, ignore.case = TRUE)
+cytT_cols    <- grep("_mean_cytT$",                colnames(merged_df), value = TRUE, ignore.case = TRUE)
+helperT_cols <- grep("_mean_helperT$",             colnames(merged_df), value = TRUE, ignore.case = TRUE)
+regT_cols    <- grep("_mean_regT$",                colnames(merged_df), value = TRUE, ignore.case = TRUE)
+
+# Check
+cat("Cancer:",  length(cancer_cols),  "\n"); writeLines(cancer_cols)
+cat("Stroma:",  length(stroma_cols),  "\n"); writeLines(stroma_cols)
+cat("CytT:",    length(cytT_cols),    "\n"); writeLines(cytT_cols)
+cat("HelperT:", length(helperT_cols), "\n"); writeLines(helperT_cols)
+cat("RegT:",    length(regT_cols),    "\n"); writeLines(regT_cols)
+
+```
+```{r}
+
+###run limma on cell types by prognostic group
+# Create a new df with prognostic groups merged in — original merged_df untouched
+analysis_df <- merge(merged_df, prognostic_groups, by = "patient_id", all.x = TRUE)
+
+# Confirm
+table(analysis_df$profile_group, useNA = "always")
+
+all_cell_cols <- c(cancer_cols, stroma_cols, cytT_cols, helperT_cols, regT_cols)
+
+# ── Build expression matrix ──────────────────────────────────────
+expr_mat <- t(as.matrix(analysis_df[, all_cell_cols]))
+colnames(expr_mat) <- analysis_df$patient_id
+
+# ── Design matrix ────────────────────────────────────────────────
+profile_group <- factor(analysis_df$profile_group, levels = c("Good", "Poor"))
+design <- model.matrix(~ 0 + profile_group)
+colnames(design) <- make.names(colnames(design))
+
+# ── Contrast ─────────────────────────────────────────────────────
+contrast_mat <- makeContrasts(
+  PoorvsGood = profile_groupPoor - profile_groupGood,
+  levels = design
+)
+
+# ── Fit limma ────────────────────────────────────────────────────
+fit  <- lmFit(expr_mat, design)
+fit2 <- contrasts.fit(fit, contrast_mat)
+fit2 <- eBayes(fit2)
+
+# ── Extract results ──────────────────────────────────────────────
+results_limma <- topTable(fit2,
+                          coef          = "PoorvsGood",
+                          number        = Inf,
+                          adjust.method = "BH",
+                          sort.by       = "P")
+
+# ── Annotate by cell type ────────────────────────────────────────
+results_limma$cell_type <- dplyr::case_when(
+  rownames(results_limma) %in% cancer_cols  ~ "NonImmuneEpithelium",
+  rownames(results_limma) %in% stroma_cols  ~ "NonImmuneStroma",
+  rownames(results_limma) %in% cytT_cols    ~ "CytotoxicT",
+  rownames(results_limma) %in% helperT_cols ~ "HelperT",
+  rownames(results_limma) %in% regT_cols    ~ "RegulatoryT",
+  TRUE ~ "Other"
+)
+
+# ── Save ─────────────────────────────────────────────────────────
+write.csv(results_limma, "limma_differential_abundance_PoorvsGood_fn.csv")
+saveRDS(results_limma,   "limma_differential_abundance_PoorvsGood_fn.rds")
+
+# ── Quick look ───────────────────────────────────────────────────
+head(results_limma, 20)
+```
+```{r}
+options(scipen = 999)
+# ── 5 tables: UP IN POOR ─────────────────────────────────────────
+for (ct in cell_types) {
+  tbl <- results_limma %>%
+    filter(cell_type == ct, logFC > 0.15) %>%
+    arrange(desc(logFC)) %>%
+    select(feature, logFC, AveExpr, t, P.Value, adj.P.Val)
+  
+  cat("\n====== UP IN POOR |", ct, "| n =", nrow(tbl), "======\n")
+  print(tbl, n = Inf)
+}
+
+# ── 5 tables: UP IN GOOD ─────────────────────────────────────────
+for (ct in cell_types) {
+  tbl <- results_limma %>%
+    filter(cell_type == ct, logFC < -0.15) %>%
+    arrange(logFC) %>%
+    select(feature, logFC, AveExpr, t, P.Value, adj.P.Val)
+  
+  cat("\n====== UP IN GOOD |", ct, "| n =", nrow(tbl), "======\n")
+print(tbl, n = Inf)
+}
+```
+```{r}
+#####differential abundance at prognoisis level not split by cell type
+
+```
+
