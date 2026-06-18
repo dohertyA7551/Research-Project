@@ -32,6 +32,10 @@ library(tidyr)
 library(tibble)
 library(umap)
 library(limma)
+library(factoextra)
+library(cluster)
+library(randomForestSRC)
+
 ```
 
 ```{r}
@@ -82,10 +86,323 @@ ggsurvplot(
 )
 ```
 ```{r}
+
+
+
+```
+
+
+```{r}
 ### two approches to invesitage surivial
 # Cluster patients by their full probability profile
 set.seed(42)
-prob_mat <- as.matrix(merged_df[, leiden_cols])
+prob_mat_raw <- as.matrix(merged_df[, leiden_cols])
+
+# ── Flag columns with >99% zero values ───────────────────────────────────────
+zero_frac     <- colMeans(prob_mat_raw == 0)
+cols_to_remove <- names(zero_frac[zero_frac > 0.99])
+cols_to_keep   <- names(zero_frac[zero_frac <= 0.99])
+
+cat("Removed columns (>99% zeros):\n")
+print(cols_to_remove)
+cat("\nRetained columns:\n")
+print(cols_to_keep)
+
+# ── Filter matrix ─────────────────────────────────────────────────────────────
+prob_mat <- prob_mat_raw[, cols_to_keep, drop = FALSE]
+cat("\nDimensions before:", dim(prob_mat_raw), "\n")
+cat("Dimensions after: ", dim(prob_mat), "\n")
+
+dist_mat <- dist(prob_mat)
+
+
+###### got to decide on corrrect number for k
+
+k_max <- 6
+
+fviz_nbclust(prob_mat, kmeans, method = "wss", k.max = k_max) +
+  geom_vline(xintercept = 3, linetype = "dashed", color = "red") +  # adjust after inspection
+  labs(title = "Elbow Plot – WSS vs. Number of Clusters",
+       subtitle = "Look for the 'knee' where WSS drop flattens")
+
+#### elbow plot wasn't very clear so lets try sillouhete
+# 2x2 panel layout
+
+par(mfrow = c(2, 2), mar = c(4, 4, 3, 1))
+
+for (k in 2:10) {
+  set.seed(42)
+  km  <- kmeans(prob_mat, centers = k, nstart = 25)
+  sil <- silhouette(km$cluster, dist_mat)
+  avg <- round(mean(sil[, "sil_width"]), 3)
+  
+  plot(sil,
+       main    = paste0("k = ", k, "  |  Avg sil = ", avg),
+       col     = 1:k,         # different colour per cluster
+       border  = NA,
+       do.n.k  = FALSE,       # suppress redundant n/k annotation
+       cex.names = 0.8)
+  abline(v = avg, lty = 2, col = "red")  # red dashed = avg silhouette
+}
+
+### dam not as clean as I hoped
+# Identify which samples fall in the bad cluster
+set.seed(42)
+km5 <- kmeans(prob_mat, centers = 5, nstart = 25)
+bad_samples <- which(km5$cluster == 2)
+
+# Check their Leiden probability profiles
+prob_mat[bad_samples, ]  
+rowMeans(prob_mat[bad_samples, ])  
+apply(prob_mat[bad_samples, ], 1, max)
+```
+
+```{r}
+
+
+#### i want a method that incorporates the surivival data
+# ── 0. Prep data ──────────────────────────────────────────────────────────────
+set.seed(42)
+prob_mat     <- as.matrix(merged_df[, leiden_cols])
+zero_frac    <- colMeans(prob_mat == 0)
+leiden_cols_filtered <- names(zero_frac[zero_frac <= 0.9999])
+
+rsf_data <- merged_df[, c("dfs_months", "dfs_event", leiden_cols_filtered)]
+
+## see what was removed
+ 
+
+cat("NAs in rsf_data after imputation:", sum(is.na(rsf_data)), "\n")
+cat("NaNs in rsf_data after imputation:", 
+    sum(sapply(rsf_data, function(x) sum(is.nan(x)))), "\n")
+
+# ── Find exactly where the 9 NAs are ─────────────────────────────────────────
+na_locations <- which(is.na(rsf_data), arr.ind = TRUE)
+print(na_locations)  # shows row and column of each NA
+
+# Which columns have NAs?
+na_cols <- colnames(rsf_data)[unique(na_locations[, "col"])]
+cat("Columns with NAs:", na_cols, "\n")
+
+# Which rows?
+na_rows <- unique(na_locations[, "row"])
+cat("Rows with NAs:", na_rows, "\n")
+
+# ── 1. Fit RSF ────────────────────────────────────────────────────────────────
+set.seed(42)
+rsf_fit <- rfsrc(
+  Surv(dfs_months, dfs_event) ~ .,
+  data       = rsf_data,
+  ntree      = 1000,
+  importance = TRUE,
+  ntime      = 100,
+  seed       = 42
+)
+
+print(rsf_fit)  # OOB C-index — >0.6 is reasonable, >0.7 is good
+
+# ── 2. Variable importance ────────────────────────────────────────────────────
+vimp <- sort(rsf_fit$importance, decreasing = TRUE)
+par(mar = c(4, 10, 3, 1))
+barplot(rev(vimp[1:15]),
+        horiz   = TRUE,
+        las     = 1,
+        col     = "steelblue",
+        main    = "RSF Variable Importance: Top 15 Leiden Cell Types",
+        xlab    = "VIMP")
+
+# ── 3. Minimal depth (interaction structure) ──────────────────────────────────
+md_obj <- max.subtree(rsf_fit)
+print(md_obj$order[1:15, ])  # lower depth = stronger role in interactions
+
+# Minimal depth interaction matrix
+md_obj <- max.subtree(rsf_fit, sub.order = TRUE)
+
+# Print the interaction table (lower value = stronger interaction)
+print(round(md_obj$sub.order, 2))
+
+sub_order <- md_obj$sub.order
+sub_df <- melt(sub_order)
+colnames(sub_df) <- c("Var1", "Var2", "MinDepth")
+
+ggplot(sub_df, aes(x = Var1, y = Var2, fill = MinDepth)) +
+  geom_tile() +
+  scale_fill_gradient(low = "red", high = "white",
+                      name = "Min Depth\n(lower = stronger)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Leiden Cell Type Pairwise Interactions (Minimal Depth)",
+       x = "", y = "")
+
+###no interactions interestingly
+# ── Rebuild rsf_data: drop only on dfs NAs ────────────────────────────────────
+survival_complete <- !is.na(merged_df$dfs_months) & !is.na(merged_df$dfs_event)
+rsf_data <- merged_df[survival_complete, c("dfs_months", "dfs_event", leiden_cols_filtered)]
+
+# Verify
+cat("rsf_data rows:", nrow(rsf_data), "\n")  # should now be 267
+cat("rsf_fit n:    ", rsf_fit$n, "\n")       # 267 — must match
+#Build survival_df with risk score
+survival_df          <- rsf_data
+survival_df$rsf_risk <- predict(rsf_fit, newdata = rsf_data)$predicted
+
+# ── Check what's actually in survival_df ─────────────────────────────────────
+colnames(survival_df)  # is rsf_risk in there?
+nrow(survival_df)      # should be 267
+
+preds <- predict(rsf_fit, newdata = rsf_data)$predicted
+survival_df <- as.data.frame(rsf_data)
+survival_df$rsf_risk <- preds
+
+cat("rsf_risk exists:", "rsf_risk" %in% colnames(survival_df), "\n")  # TRUE
+# ── Now the histogram is ready to run ─────────────────────────────────────────
+# ── Histogram of RSF risk score distribution ──────────────────────────────────
+ggplot(survival_df, aes(x = rsf_risk)) +
+  geom_histogram(bins = 30, fill = "steelblue", colour = "white", alpha = 0.8) +
+  geom_vline(xintercept = quantile(survival_df$rsf_risk, probs = c(1/3, 2/3)),
+             linetype = "dashed", colour = "orange", linewidth = 0.8) +
+  geom_vline(xintercept = quantile(survival_df$rsf_risk, probs = c(0.25, 0.5, 0.75)),
+             linetype = "dotted", colour = "red", linewidth = 0.8) +
+  annotate("text", x = quantile(survival_df$rsf_risk, 1/3), 
+           y = Inf, label = "Tertile 1", vjust = 2, hjust = 1.1, 
+           colour = "orange", size = 3.5) +
+  annotate("text", x = quantile(survival_df$rsf_risk, 2/3), 
+           y = Inf, label = "Tertile 2", vjust = 2, hjust = 1.1, 
+           colour = "orange", size = 3.5) +
+  annotate("text", x = quantile(survival_df$rsf_risk, 0.5), 
+           y = Inf, label = "Median", vjust = 4, hjust = -0.1, 
+           colour = "red", size = 3.5) +
+  labs(title = "RSF Risk Score Distribution",
+       subtitle = "Orange dashed = tertile cuts | Red dotted = quartile cuts",
+       x = "RSF Predicted Risk Score", y = "Count") +
+  theme_minimal()
+
+# ── 5. Risk score + KM plot ───────────────────────────────────────────────────
+merged_df$rsf_risk  <- predict(rsf_fit, newdata = rsf_data)$predicted
+merged_df$risk_grp  <- ifelse(
+  merged_df$rsf_risk > median(merged_df$rsf_risk), "High", "Low"
+)
+
+km_fit <- survfit(Surv(dfs_months, dfs_event) ~ risk_grp, data = merged_df)
+
+ggsurvplot(
+  km_fit,
+  data       = merged_df,
+  pval       = TRUE,
+  risk.table = TRUE,
+  xlab       = "Time (months)",
+  ylab       = "Disease-Free Survival",
+  title      = "DFS: RSF-derived Leiden Abundance Risk Groups",
+  palette    = c("#E7298A", "#1B9E77"),
+  legend.labs = c("High Risk", "Low Risk")
+)
+
+
+### se what it looks like surivival wise
+# ── 3 groups ──────────────────────────────────────────────────────────────────
+survival_df$risk_grp3 <- cut(
+  survival_df$rsf_risk,
+  breaks         = quantile(survival_df$rsf_risk, probs = c(0, 1/3, 2/3, 1)),
+  labels         = c("Low", "Mid", "High"),
+  include.lowest = TRUE
+)
+table(survival_df$risk_grp3)  # ~89 per group
+
+# ── 4 groups ──────────────────────────────────────────────────────────────────
+survival_df$risk_grp4 <- cut(
+  survival_df$rsf_risk,
+  breaks         = quantile(survival_df$rsf_risk, probs = c(0, 0.25, 0.5, 0.75, 1)),
+  labels         = c("Q1", "Q2", "Q3", "Q4"),
+  include.lowest = TRUE
+)
+
+
+table(survival_df$risk_grp4) 
+
+
+#km plots
+km3 <- survfit(Surv(dfs_months, dfs_event) ~ risk_grp3, data = survival_df)
+ggsurvplot(km3, data = survival_df, pval = TRUE, risk.table = TRUE,
+           palette     = c("#1B9E77", "#D95F02", "#E7298A"),
+           legend.labs = c("Low", "Mid", "High"),
+           xlab        = "Time (months)",
+           title       = "DFS: 3 Risk Groups")
+km4 <- survfit(Surv(dfs_months, dfs_event) ~ risk_grp4, data = survival_df)
+
+ggsurvplot(
+  km4,
+  data        = survival_df,
+  pval        = TRUE,
+  pval.method = TRUE,
+  risk.table  = TRUE,
+  conf.int    = FALSE,
+  xlab        = "Time (months)",
+  ylab        = "Disease-Free Survival Probability",
+  title       = "DFS by RSF-Derived Risk Groups (Quartiles)",
+  legend.title = "Risk Group",
+  legend.labs = c("Q1 Low", "Q2 Mid-Low", "Q3 Mid-High", "Q4 High"),
+  palette     = c("#1B9E77", "#7FC97F", "#D95F02", "#E7298A"),
+  risk.table.height = 0.28,
+  ggtheme     = theme_minimal()
+)
+```
+```{r}
+# ══════════════════════════════════════════════════════════════════════════════
+# FULL REPORTING OUTPUT (3 GROUPS) 
+# ══════════════════════════════════════════════════════════════════════════════
+
+cat("=== METHODS: RSF MODEL SPECIFICATION ===\n")
+cat("Number of trees:", rsf_fit$ntree, "\n")
+cat("mtry:", rsf_fit$mtry, "\n")
+cat("nodesize:", rsf_fit$nodesize, "\n")
+cat("Training sample size:", rsf_fit$n, "\n")
+cat("Number of events:", rsf_fit$ndead, "\n")
+cat("Total Leiden columns before filtering:", length(leiden_cols), "\n")
+cat("Columns removed (>99.99% zeros):", sum(zero_frac > 0.9999), "\n")
+cat("Columns retained for analysis:", length(leiden_cols_filtered), "\n")
+
+cat("\n=== METHODS: GROUP ALLOCATION ===\n")
+cuts3 <- quantile(survival_df$rsf_risk, probs = c(0, 1/3, 2/3, 1))
+cat("Tertile cut points:\n"); print(round(cuts3, 4))
+cat("\nGroup sizes:\n"); print(table(survival_df$risk_grp3))
+cat("\nEvents per group:\n")
+etab3 <- table(survival_df$risk_grp3, survival_df$dfs_event)
+colnames(etab3) <- c("Censored", "Event")
+print(etab3)
+
+cat("\n=== RESULTS: MODEL PERFORMANCE ===\n")
+c_index <- 1 - rsf_fit$err.rate[rsf_fit$ntree]
+cat("OOB C-index:", round(c_index, 3), "\n")
+
+cat("\n=== RESULTS: TOP 10 VARIABLE IMPORTANCE ===\n")
+vimp_df <- data.frame(
+  leiden_col = names(rsf_fit$importance),
+  VIMP       = round(rsf_fit$importance, 5)
+) |> dplyr::arrange(desc(VIMP))
+print(head(vimp_df, 10))
+
+cat("\n=== RESULTS: LOG-RANK TEST ===\n")
+lr_test <- survdiff(Surv(dfs_months, dfs_event) ~ risk_grp3, data = survival_df)
+p_exact <- 1 - pchisq(lr_test$chisq, df = 2)
+cat("Chi-squared:", round(lr_test$chisq, 3), "\n")
+cat("Degrees of freedom: 2\n")
+cat("Log-rank p-value:", format(p_exact, scientific = TRUE), "\n")
+
+cat("\n=== RESULTS: MEDIAN SURVIVAL PER GROUP ===\n")
+km3 <- survfit(Surv(dfs_months, dfs_event) ~ risk_grp3, data = survival_df)
+print(summary(km3)$table[, c("records", "events", "median", "0.95LCL", "0.95UCL")])
+
+cat("\n=== RESULTS: COX HR FOR CONTINUOUS RISK SCORE ===\n")
+cox_cont <- coxph(Surv(dfs_months, dfs_event) ~ rsf_risk, data = survival_df)
+print(summary(cox_cont)$coefficients)
+print(summary(cox_cont)$conf.int)
+
+cat("\n=== END OF REPORTING OUTPUT ===\n")
+```
+
+```{r}
+###### cluster code is below
+
 km_profiles <- kmeans(prob_mat, centers = 2)
 
 
@@ -162,6 +479,28 @@ diff_df$difference <- abs(diff_df$group1_prob - diff_df$group2_prob)
 diff_df %>%
   arrange(desc(difference)) %>%
   head(15)
+
+
+
+```
+```{r}
+merged_df$profile_group <- factor(
+  km_profiles$cluster,
+  levels = c(1, 2),
+  labels = c("Poor", "Good")
+)
+
+# Counts per group
+table(merged_df$profile_group)
+
+
+profile_assignments <- data.frame(
+  patient_id    = merged_df$patient_id,
+  profile_group = merged_df$profile_group   # now labelled Good/Poor
+)
+###fn on file means from new
+
+saveRDS(profile_assignments, file = "profile_group_assignments_fn.rds")
 ```
 
 ```{r}
@@ -202,6 +541,17 @@ ggplot(merged_df_scores, aes(x = score_logratio)) +
 ```{r}
 grep("adjuv", colnames(merged_df), ignore.case = TRUE, value = TRUE)
 table(merged_df$has_adjuvant_chemotherapy, useNA = "ifany")
+```
+
+
+
+```{r}
+
+#####adjuvent investigation begins here
+prognostic_groups <- readRDS( file = "profile_group_assignments_fn.rds")
+
+head(prognostic_groups)
+colnames(prognostic_groups)  
 
 merged_df_adjuvent <-merged_df %>%
   filter(has_adjuvant_chemotherapy =="yes")
@@ -216,79 +566,138 @@ merged_df_dfs <- merged_df_adjuvent %>%
 length(merged_df_dfs$dfs_months)
 ```
 ```{r}
-merged_df_dfs <- merged_df_dfs %>%
-  mutate(
-    dfs_group_adjuv = factor(
-      dfs_event,
-      levels = c(0, 1),
-      labels = c("No DFS event", "DFS event")
-    )
-  )
+merged_relapse <- merged_df_dfs %>%
+  left_join(prognostic_groups, by = "patient_id")
 
-table(merged_df_dfs$dfs_group_adjuv, useNA = "ifany")
-mc_prob_stats_adjuvent <- map_dfr(leiden_cols, function(col) {
-  p <- merged_df_dfs[[col]]
+# check join worked
+table(merged_relapse$profile_group, useNA = "ifany")
 
-  p_event   <- p[merged_df_dfs$dfs_group_adjuv == "DFS event"]
-  p_noevent <- p[merged_df_dfs$dfs_group_adjuv == "No DFS event"]
+tbl <- table(
+  Relapse   = merged_relapse$dfs_event,
+  ProgGroup = merged_relapse$profile_group
+)
+print(tbl)
+
+chisq.test(tbl)
+# visualise
+merged_relapse %>%
+  filter(!is.na(profile_group), !is.na(dfs_event)) %>%
+  count(dfs_event, profile_group) %>%
+  group_by(dfs_event) %>%
+  mutate(pct = n / sum(n) * 100,
+         dfs_label = ifelse(dfs_event == 1, "Relapsed", "No Relapse")) %>%
+  ggplot(aes(x = dfs_label, y = pct, fill = factor(profile_group))) +
+  geom_bar(stat = "identity", position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = "DFS Status", y = "Proportion", fill = "Prognostic Group") +
+  theme_classic()
+
+```
+```{r}
+# use the leiden abundance cols as predictors
+leiden_cols_new <- colnames(merged_relapse)[grepl("abundance_metacluster_leiden", colnames(merged_relapse))]
+X <- as.matrix(merged_relapse[, leiden_cols_new])
+y <- merged_relapse$dfs_event
+
+# LASSO logistic regression
+fit <- cv.glmnet(X, y, family = "binomial", alpha = 1, nfolds =5)
+
+# plot cross-validation curve
+plot(fit)
+
+# coefficients at best lambda
+coef(fit, s = "lambda.min")
+
+# non-zero predictors only
+coef_mat <- coef(fit, s = "lambda.min")
+coef_mat[coef_mat[,1] != 0, , drop = FALSE]
+
+# does MC_80 abundance perfectly separate relapse groups?
+merged_relapse %>%
+  select(dfs_event, abundance_metacluster_leiden_1.0_MC_80) %>%
+  group_by(dfs_event) %>%
+  summarise(mean = mean(abundance_metacluster_leiden_1.0_MC_80),
+            sd   = sd(abundance_metacluster_leiden_1.0_MC_80))
+```
+```{r}
+# extract non-zero coefficients
+coef_mat <- as.matrix(coef(fit, s = "lambda.min"))
+coef_df <- data.frame(
+  cluster = rownames(coef_mat),
+  coefficient = coef_mat[, 1]
+) %>%
+  filter(cluster != "(Intercept)", coefficient != 0)
+
+# split into > 0 (associated with relapse) and < 0 (protective)
+relapse_associated <- coef_df %>% filter(coefficient > 0) %>% arrange(desc(coefficient))
+protective         <- coef_df %>% filter(coefficient < 0) %>% arrange(coefficient)
+
+cat("=== Associated with RELAPSE (coef > 0) ===\n")
+print(relapse_associated)
+
+cat("\n=== PROTECTIVE against relapse (coef < 0) ===\n")
+print(protective)
+```
+```{r}
+library(pheatmap)
+# LASSO selected clusters
+lasso_clusters <- c(
+  "abundance_metacluster_leiden_1.0_MC_80",
+  "abundance_metacluster_leiden_1.0_MC_15",
+  "abundance_metacluster_leiden_1.0_MC_52",
+  "abundance_metacluster_leiden_1.0_MC_0",
+  "abundance_metacluster_leiden_1.0_MC_8",
+  "abundance_metacluster_leiden_1.0_MC_35",
+  "abundance_metacluster_leiden_1.0_MC_13",
+  "abundance_metacluster_leiden_1.0_MC_7",
+  "abundance_metacluster_leiden_1.0_MC_11",
+  "abundance_metacluster_leiden_1.0_MC_12"
+)
+
+heatmap_data <- merged_relapse %>%
+  filter(!is.na(dfs_event)) %>%
+  group_by(dfs_event) %>%
+  summarise(across(all_of(lasso_clusters), mean, na.rm = TRUE)) %>%
+  column_to_rownames("dfs_event") %>%
+  t()
+
+rownames(heatmap_data) <- gsub("abundance_metacluster_leiden_1.0_", "", rownames(heatmap_data))
+colnames(heatmap_data) <- c("No Relapse", "Relapse")
+
+# remove zero variance rows
+heatmap_data_clean <- heatmap_data[apply(heatmap_data, 1, sd) != 0, ]
+
+pheatmap(heatmap_data_clean,
+         scale = "row",
+         cluster_cols = FALSE,
+         cluster_rows = TRUE,
+         color = colorRampPalette(c("navy", "white", "firebrick"))(100),
+         main = "LASSO-selected Metacluster Abundance by Relapse Status",
+         fontsize_row = 10)
+
+
+mc_prob_stats_lasso <- map_dfr(lasso_clusters, function(col) {
+  p <- merged_relapse[[col]]
+
+  p_event   <- p[merged_relapse$dfs_event == 1]
+  p_noevent <- p[merged_relapse$dfs_event == 0]
 
   p_event   <- p_event[!is.na(p_event)]
   p_noevent <- p_noevent[!is.na(p_noevent)]
 
-  if (length(p_event) == 0 || length(p_noevent) == 0) {
-    return(tibble(
-      metacluster          = col,
-      mean_prob_event      = NA_real_,
-      mean_prob_noevent    = NA_real_,
-      median_prob_event    = NA_real_,
-      median_prob_noevent  = NA_real_,
-      p_value              = NA_real_
-    ))
-  }
-
   wt <- wilcox.test(p_event, p_noevent, exact = FALSE)
 
   tibble(
-    metacluster          = col,
-    mean_prob_event      = mean(p_event),
-    mean_prob_noevent    = mean(p_noevent),
-    median_prob_event    = median(p_event),
-    median_prob_noevent  = median(p_noevent),
-    p_value              = wt$p.value
+    metacluster         = gsub("abundance_metacluster_leiden_1.0_", "", col),
+    mean_relapse        = mean(p_event),
+    mean_no_relapse     = mean(p_noevent),
+    p_value             = wt$p.value
   )
-})
-
-mc_prob_stats_adjuvent <- mc_prob_stats_adjuvent %>%
+}) %>%
+  mutate(adj_p_value = p.adjust(p_value, method = "BH")) %>%
   arrange(p_value)
 
-mc_prob_stats_adjuvent
-
-```
-```{r}
-mc_prob_stats_adjuvent_event_p_sorted <- mc_prob_stats_adjuvent %>%
-  arrange(desc(mean_prob_event), p_value)
-
-head(mc_prob_stats_adjuvent_event_p_sorted)
-
-
-
-mc_prob_stats_adjuvent <- mc_prob_stats_adjuvent %>%
-  mutate(
-    diff_event_minus_noevent = mean_prob_event - mean_prob_noevent
-  )
-event_enriched_adjuvent <- mc_prob_stats_adjuvent %>%
-  arrange(desc(diff_event_minus_noevent))
-
-head(event_enriched_adjuvent, 10)
+print(mc_prob_stats_lasso, n = Inf)
 ```
 
-```{r}
-mc_prob_stats_adjuvent_noevent_p_sorted <- mc_prob_stats_adjuvent %>%
-  arrange(desc(mean_prob_noevent), p_value)
-head(mc_prob_stats_adjuvent_event_p_sorted)
-noevent_enriched_adjuvent <- mc_prob_stats_adjuvent %>%
-  arrange(diff_event_minus_noevent)
-
-head(noevent_enriched_adjuvent, 10)
-```
 
