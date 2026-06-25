@@ -1,0 +1,526 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(survival)
+library(coxphf)
+library(purrr)
+library(glmnet)
+library(readr)
+library(broom)
+library(survminer)
+library(stringr)
+library(tidyr)
+library(tibble)
+library(umap)
+library(limma)
+library(factoextra)
+library(cluster)
+library(randomForestSRC)
+library(survivalROC)
+library(maxstat)
+library(reshape2)
+library(riskRegression)
+library(ggpubr)
+library(RColorBrewer)
+
+
+```
+
+```{r}
+# ── Load saved RSF model ──────────────────────────────────────────────────────
+rsf_fit_v2 <- readRDS("rsf_fit_v2.rds")
+merged_df <-readRDS(file ="RCSI_Taxonomy_clin_prot_merged_df.rds")
+survival_df <- readRDS("survival_df_with_risk.rds")
+head(survival_df[, c("patient_id","dfs_months", "dfs_event", "rsf_risk", "risk_grp")])
+clin_data <-readRDS( file= "RCSI_Taxonomy_clinical_merged.rds")
+
+
+```
+
+
+
+```{r}
+###join surv and clin data
+clin_risk <- clin_data %>%
+  rename(patient_id = Patient) %>%   # Patient. (old) → patient_id (new)
+  inner_join(survival_df[, c("patient_id", "risk_grp")], by = "patient_id")
+colnames(clin_risk)
+```
+```{r}
+####get clin info on gorups
+
+colours <- c(
+  "Low"  = "#004B23",  # deep forest green
+  "High" = "#800000"   # deep maroon red
+)
+
+
+# ── Age ───────────────────────────────────────────────────────────────────────
+library(ggpubr) 
+p_age <- ggplot(clin_risk, aes(x = risk_grp, y = age, fill = risk_grp)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = 21) +
+  geom_jitter(width = 0.15, alpha = 0.3, size = 1) +
+  scale_fill_manual(values = colours) +
+  stat_compare_means(
+    method = "wilcox.test",
+    label  = "p.format",
+    label.x = Inf,    # right edge
+    label.y = Inf,    # top edge
+    hjust   = 1.1,    # nudge left from absolute corner
+    vjust   = 1.5,    # nudge down from absolute corner
+    size    = 3.5
+  ) +
+  labs(title = "Age by Risk Group", x = "", y = "Age (years)") +
+  theme_classic(base_size = 12) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold", size = 11)
+  )
+
+p_age
+```
+
+
+```{r}
+
+###stage
+
+library(dplyr)
+library(ggplot2)
+
+# 1. Summarise counts and percentages by risk group and stage
+stage_summary <- clin_risk %>%
+  filter(!is.na(stage)) %>%
+  count(risk_grp, stage) %>%
+  group_by(risk_grp) %>%
+  mutate(
+    pct   = n / sum(n) * 100,
+    label = paste0(n, "\n(", round(pct, 1), "%)")
+  ) %>%
+  ungroup()
+
+# 2. Per-stage p-values using chi-square on a proper 2x2 table
+#    Table: risk_grp (Low/High) x in_this_stage (TRUE/FALSE)
+clin_filtered <- clin_risk %>% filter(!is.na(stage))
+
+stages <- sort(unique(clin_filtered$stage))
+
+stage_pvals <- lapply(stages, function(s) {
+  tab <- table(
+    risk_grp   = clin_filtered$risk_grp,
+    in_stage   = clin_filtered$stage == s
+  )
+  p <- tryCatch(chisq.test(tab)$p.value, error = function(e) NA_real_)
+  data.frame(
+    stage  = s,
+    p      = p,
+    signif = dplyr::case_when(
+      is.na(p)    ~ "ns",
+      p < 0.001   ~ "***",
+      p < 0.01    ~ "**",
+      p < 0.05    ~ "*",
+      TRUE        ~ "ns"
+    ),
+    stringsAsFactors = FALSE
+  )
+}) %>%
+  bind_rows()
+
+# 3. y-positions for brackets per stage
+# In step 3 — increase bracket height above bars
+brackets <- stage_summary %>%
+  group_by(stage) %>%
+  summarise(y_max = max(pct), .groups = "drop") %>%
+  left_join(stage_pvals, by = "stage") %>%
+  mutate(
+    y_bracket = y_max + 13,   # was 6, now 12
+    y_star    = y_max + 15    # was 8, now 14
+  )
+
+# 4. Base plot
+p_stage <- ggplot(stage_summary, aes(x = factor(stage), y = pct, fill = risk_grp)) +
+  geom_col(position = "dodge", colour = "white", linewidth = 0.3) +
+  geom_text(
+    aes(label = label),
+    position = position_dodge(width = 0.9),
+    vjust = -0.3, size = 3
+  ) +
+  scale_fill_manual(values = colours) +
+  scale_x_discrete() +
+  scale_y_continuous(limits = c(0, max(brackets$y_star, na.rm = TRUE) + 6)) +
+  labs(
+    title = "Stage Distribution by Risk Group",
+    x = "Stage", y = "% within risk group", fill = "Risk Group"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 11)
+  )
+
+# 5. Add GraphPad-style brackets + stars per stage
+for (i in seq_len(nrow(brackets))) {
+  s   <- brackets$stage[i]
+  yb  <- brackets$y_bracket[i]
+  ys  <- brackets$y_star[i]
+  lab <- brackets$signif[i]
+
+  if (is.na(lab) || lab == "ns") next
+
+  x_center <- which(levels(factor(stages)) == as.character(s))
+
+  p_stage <- p_stage +
+    annotate("segment",
+      x = x_center - 0.2, xend = x_center + 0.2,
+      y = yb, yend = yb) +
+    annotate("segment",
+      x = x_center - 0.2, xend = x_center - 0.2,
+      y = yb, yend = yb - 3) +
+    annotate("segment",
+      x = x_center + 0.2, xend = x_center + 0.2,
+      y = yb, yend = yb - 3) +
+    annotate("text",
+      x = x_center, y = ys,
+      label = lab, size = 4)
+}
+
+p_stage
+```
+
+
+```{r}
+library(ggplot2)
+library(ggpubr)
+library(dplyr)
+
+# ── 0. Colours ────────────────────────────────────────────────────────────────
+colours <- c("Low" = "#004B23", "High" = "#800000")
+
+# ── 1. Clean binary treatment variables ───────────────────────────────────────
+for (var in c("has_adjuvant_chemotherapy",
+              "has_neoadjuvant_chemoradiotherapy")) {
+  clin_risk[[var]][!clin_risk[[var]] %in% c("yes", "no")] <- NA
+  clin_risk[[var]] <- factor(clin_risk[[var]], levels = c("no", "yes"))
+}
+
+# ── 2. Clean molecular variables ──────────────────────────────────────────────
+clin_risk$cms_subtype <- factor(
+  ifelse(clin_risk$cms_subtype %in% c("CMS1", "CMS2", "CMS3", "CMS4"),
+         as.character(clin_risk$cms_subtype), NA),
+  levels = c("CMS1", "CMS2", "CMS3", "CMS4")
+)
+
+clin_risk$kras_status <- factor(
+  ifelse(clin_risk$kras_status %in% c("mutant", "wild_type"),
+         as.character(clin_risk$kras_status), NA),
+  levels = c("mutant", "wild_type")
+)
+
+# ── 3. Build plot_df ──────────────────────────────────────────────────────────
+plot_vars <- c("risk_grp", "age", "stage",
+               "has_adjuvant_chemotherapy",
+               "has_neoadjuvant_chemoradiotherapy",
+               "kras_status", "p53_status", "cms_subtype")
+
+plot_df <- clin_risk %>%
+  select(all_of(plot_vars)) %>%
+  select(where(~ mean(is.na(.)) <= 0.9))
+
+cat("Columns retained:\n"); print(names(plot_df))
+cat("Rows:", nrow(plot_df), "\n")
+
+# ── 4. Standard cat_plot ──────────────────────────────────────────────────────
+cat_plot <- function(var, title) {
+  if (!var %in% names(plot_df)) {
+    message(var, " was removed (>90% NA) — skipping.")
+    return(invisible(NULL))
+  }
+
+  df <- plot_df %>%
+    filter(!is.na(.data[[var]]), !is.na(risk_grp)) %>%
+    count(risk_grp, .data[[var]]) %>%
+    group_by(risk_grp) %>%
+    mutate(pct = n / sum(n) * 100) %>%
+    ungroup()
+
+  colnames(df)[2] <- "category"
+
+  tab <- table(
+    plot_df$risk_grp[!is.na(plot_df[[var]]) & !is.na(plot_df$risk_grp)],
+    plot_df[[var]][!is.na(plot_df[[var]]) & !is.na(plot_df$risk_grp)]
+  )
+
+  pval <- tryCatch(
+    chisq.test(tab)$p.value,
+    warning = function(w) chisq.test(tab, simulate.p.value = TRUE)$p.value,
+    error   = function(e) NA_real_
+  )
+
+  p_lab <- dplyr::case_when(
+    is.na(pval)  ~ "p = NA",
+    pval < 0.001 ~ "p < 0.001",
+    pval < 0.01  ~ paste0("p = ", round(pval, 3)),
+    TRUE         ~ paste0("p = ", round(pval, 2))
+  )
+
+  ggplot(df, aes(x = category, y = pct, fill = risk_grp)) +
+    geom_col(position = "dodge", colour = "white", linewidth = 0.3) +
+    scale_fill_manual(values = colours) +
+    annotate("text",
+             x = Inf, y = Inf, label = p_lab,
+             hjust = 1.1, vjust = 1.5,
+             size = 3.2, colour = "grey30") +
+    labs(title = title, x = "", y = "% within risk group", fill = "Risk Group") +
+    theme_classic(base_size = 11) +
+    theme(plot.title = element_text(face = "bold", size = 10))
+}
+
+# ── 5. CMS plot with per-subtype chi-sq brackets ──────────────────────────────
+cms_plot <- function() {
+  df <- plot_df %>%
+    filter(!is.na(cms_subtype), !is.na(risk_grp)) %>%
+    count(risk_grp, cms_subtype) %>%
+    group_by(risk_grp) %>%
+    mutate(pct = n / sum(n) * 100) %>%
+    ungroup() %>%
+    tidyr::complete(risk_grp, cms_subtype, fill = list(n = 0, pct = 0))
+
+  stat_df <- bind_rows(lapply(levels(plot_df$cms_subtype), function(s) {
+    sub <- plot_df %>%
+      filter(!is.na(risk_grp), cms_subtype == s)
+
+    tab <- table(sub$risk_grp)
+
+    pval <- tryCatch(
+      chisq.test(tab)$p.value,
+      warning = function(w) chisq.test(tab, simulate.p.value = TRUE)$p.value,
+      error   = function(e) NA_real_
+    )
+
+    pval_adj <- min(pval * 4, 1)
+
+    data.frame(
+      cms      = s,
+      p_raw    = pval,
+      p_adj    = pval_adj,
+      p.signif = dplyr::case_when(
+        is.na(pval_adj)  ~ "ns",
+        pval_adj < 0.001 ~ "***",
+        pval_adj < 0.01  ~ "**",
+        pval_adj < 0.05  ~ "*",
+        TRUE             ~ "ns"
+      ),
+      stringsAsFactors = FALSE
+    )
+  })) %>% filter(p.signif != "ns")
+
+  y_max <- max(df$pct, na.rm = TRUE)
+
+  p <- ggplot(df, aes(x = cms_subtype, y = pct, fill = risk_grp)) +
+    geom_col(position = "dodge", colour = "white", linewidth = 0.3) +
+    scale_fill_manual(values = colours) +
+    scale_y_continuous(limits = c(0, y_max * 1.35)) +
+    labs(title = "CMS Subtype", x = "", y = "% within risk group",
+         fill = "Risk Group") +
+    theme_classic(base_size = 11) +
+    theme(plot.title = element_text(face = "bold", size = 10))
+
+  if (nrow(stat_df) > 0) {
+    dodge_w  <- 0.9
+    bar_half <- dodge_w / 4
+
+    for (i in seq_len(nrow(stat_df))) {
+      s       <- stat_df$cms[i]
+      x_pos   <- which(levels(plot_df$cms_subtype) == s)
+      x_left  <- x_pos - bar_half
+      x_right <- x_pos + bar_half
+
+      bar_heights <- df %>% filter(cms_subtype == s) %>% pull(pct)
+      y_top  <- max(bar_heights, na.rm = TRUE)
+      y_br   <- y_top + y_max * 0.08
+      y_star <- y_br  + y_max * 0.07
+
+      p <- p +
+        annotate("segment",
+                 x = x_left, xend = x_right,
+                 y = y_br,   yend = y_br) +
+        annotate("segment",
+                 x = x_left, xend = x_left,
+                 y = y_br,   yend = y_br - y_max * 0.04) +
+        annotate("segment",
+                 x = x_right, xend = x_right,
+                 y = y_br,    yend = y_br - y_max * 0.04) +
+        annotate("text",
+                 x = (x_left + x_right) / 2, y = y_star,
+                 label = stat_df$p.signif[i], size = 5)
+    }
+  }
+
+  p
+}
+
+cms_plot()
+
+'''  # ── Overall chi-sq p in top right ─────────────────────────────────────────
+  overall_p <- tryCatch({
+    tab <- table(plot_df$risk_grp[!is.na(plot_df$cms_subtype)],
+                 plot_df$cms_subtype[!is.na(plot_df$cms_subtype)])
+    chisq.test(tab)$p.value
+  }, warning = function(w) {
+    tab <- table(plot_df$risk_grp[!is.na(plot_df$cms_subtype)],
+                 plot_df$cms_subtype[!is.na(plot_df$cms_subtype)])
+    chisq.test(tab, simulate.p.value = TRUE)$p.value
+  })
+
+  p_lab <- dplyr::case_when(
+    is.na(overall_p)  ~ "p = NA",
+    overall_p < 0.001 ~ "p < 0.001",
+    overall_p < 0.01  ~ paste0("p = ", round(overall_p, 3)),
+    TRUE              ~ paste0("p = ", round(overall_p, 2))
+  )
+
+  p + annotate("text",
+               x = Inf, y = Inf, label = p_lab,
+               hjust = 1.1, vjust = 1.5,
+               size = 3.2, colour = "grey30")
+}
+'''
+
+
+cms_plot()
+# ── 6. Print plots ────────────────────────────────────────────────────────────
+cat_plot("has_adjuvant_chemotherapy",         "Adjuvant Chemo")
+cat_plot("has_neoadjuvant_chemoradiotherapy", "Neoadjuvant CRT")
+cat_plot("kras_status", "KRAS Status")
+cat_plot("p53_status",  "P53 Status")
+cms_plot()
+
+
+```
+
+```{r}
+#####regression side project out of curiosity
+library(survival)
+
+# ── 1. Define your chosen MC covariates explicitly ────────────────────────────
+mc_vars <- c(
+  "abundance_metacluster_leiden_1.0_MC_0",
+  "abundance_metacluster_leiden_1.0_MC_47",
+  "abundance_metacluster_leiden_1.0_MC_30",
+  "abundance_metacluster_leiden_1.0_MC_7",
+  "abundance_metacluster_leiden_1.0_MC_5",
+  "abundance_metacluster_leiden_1.0_MC_10",
+  "abundance_metacluster_leiden_1.0_MC_13",
+  "abundance_metacluster_leiden_1.0_MC_17",
+  "abundance_metacluster_leiden_1.0_MC_8",
+  "abundance_metacluster_leiden_1.0_MC_6",
+  "abundance_metacluster_leiden_1.0_MC_14",
+  "abundance_metacluster_leiden_1.0_MC_38",
+  "abundance_metacluster_leiden_1.0_MC_85"
+)
+
+# ── 2. Build modelling data frame ─────────────────────────────────────────────
+cox_df <- merged_df[, c(
+  "dfs_months", "dfs_event",
+  "T_stage", "positive_nodes", "cms_subtype",
+  mc_vars
+)]
+
+# ── 3. Make sure types are right ──────────────────────────────────────────────
+cox_df$T_stage <- factor(cox_df$T_stage)
+
+# cms_subtype: make sure it is treated as categorical
+cox_df$cms_subtype <- factor(as.character(cox_df$cms_subtype))
+
+# (Optional) set a reference level, e.g. most common CMS
+cms_counts <- sort(table(cox_df$cms_subtype), decreasing = TRUE)
+ref_level  <- names(cms_counts)[1]
+cox_df$cms_subtype <- relevel(cox_df$cms_subtype, ref = ref_level)
+
+# ── 4. Drop rows with any NA in model vars ────────────────────────────────────
+cox_df <- cox_df[complete.cases(cox_df), ]
+
+# ── 5. Fit Cox model ──────────────────────────────────────────────────────────
+cox_fit <- coxph(
+  as.formula(
+    paste(
+      "Surv(dfs_months, dfs_event) ~",
+      "T_stage + positive_nodes + cms_subtype +",
+      paste(mc_vars, collapse = " + ")
+    )
+  ),
+  data = cox_df
+)
+
+summary(cox_fit)
+
+# ── 6. Diagnostics to confirm structure ───────────────────────────────────────
+# 1. What does cox_df look like?
+dim(cox_df)
+str(cox_df)
+
+# 2. How many complete cases across all model vars?
+sum(complete.cases(cox_df[, c(
+  "dfs_months", "dfs_event",
+  "T_stage", "positive_nodes", "cms_subtype",
+  mc_vars
+)]))
+
+# 3. Any NAs in the survival outcome itself?
+colSums(is.na(cox_df[, c("dfs_months", "dfs_event")]))
+
+# 4. Check that T_stage etc actually exist and are non-empty
+table(cox_df$T_stage, useNA = "ifany")
+table(cox_df$cms_subtype, useNA = "ifany")
+summary(cox_df$positive_nodes)
+
+summ <- summary(cox_fit)
+
+# data frame of coefficients
+coef_df <- data.frame(
+  term  = rownames(summ$coefficients),
+  summ$coefficients,
+  check.names = FALSE
+)
+
+coef_df
+
+sig_terms <- subset(
+  coef_df,
+  `Pr(>|z|)` < 0.05 & !is.na(`Pr(>|z|)`) & `se(coef)` > 0
+)$term
+
+sig_terms
+
+
+```
+
+
+```{r}
+mc_sig <- c(
+  "abundance_metacluster_leiden_1.0_MC_0",
+  "abundance_metacluster_leiden_1.0_MC_30",
+  "abundance_metacluster_leiden_1.0_MC_5",
+  "abundance_metacluster_leiden_1.0_MC_7"
+)
+
+cox_fit_reduced <- coxph(
+  as.formula(
+    paste(
+      "Surv(dfs_months, dfs_event) ~",
+      "T_stage + positive_nodes +",
+      paste(mc_sig, collapse = " + ")
+    )
+  ),
+  data = cox_df
+)
+
+summary(cox_fit_reduced)
+```
+
+
