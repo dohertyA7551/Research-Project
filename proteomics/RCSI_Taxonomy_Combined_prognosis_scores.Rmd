@@ -35,6 +35,11 @@ library(limma)
 library(factoextra)
 library(cluster)
 library(randomForestSRC)
+library(survivalROC)
+library(maxstat)
+library(reshape2)
+library(riskRegression)
+library(RColorBrewer)
 
 ```
 
@@ -158,246 +163,324 @@ apply(prob_mat[bad_samples, ], 1, max)
 ```
 
 ```{r}
-
-
 #### i want a method that incorporates the surivival data
+library(randomForestSRC)
+library(survival)
+
 # ── 0. Prep data ──────────────────────────────────────────────────────────────
 set.seed(42)
-prob_mat     <- as.matrix(merged_df[, leiden_cols])
-zero_frac    <- colMeans(prob_mat == 0)
-leiden_cols_filtered <- names(zero_frac[zero_frac <= 0.9999])
+prob_mat             <- as.matrix(merged_df[, leiden_cols])
+zero_frac            <- colMeans(prob_mat == 0)
+leiden_cols_filtered <- names(zero_frac[zero_frac <= 0.99])
 
 rsf_data <- merged_df[, c("dfs_months", "dfs_event", leiden_cols_filtered)]
 
-## see what was removed
- 
-
-cat("NAs in rsf_data after imputation:", sum(is.na(rsf_data)), "\n")
-cat("NaNs in rsf_data after imputation:", 
-    sum(sapply(rsf_data, function(x) sum(is.nan(x)))), "\n")
-
-# ── Find exactly where the 9 NAs are ─────────────────────────────────────────
-na_locations <- which(is.na(rsf_data), arr.ind = TRUE)
-print(na_locations)  # shows row and column of each NA
-
-# Which columns have NAs?
-na_cols <- colnames(rsf_data)[unique(na_locations[, "col"])]
-cat("Columns with NAs:", na_cols, "\n")
-
-# Which rows?
-na_rows <- unique(na_locations[, "row"])
-cat("Rows with NAs:", na_rows, "\n")
-
-# ── 1. Fit RSF ────────────────────────────────────────────────────────────────
+# ── 1. Stage 1 RSF fit ────────────────────────────────────────────────────────
 set.seed(42)
 rsf_fit <- rfsrc(
   Surv(dfs_months, dfs_event) ~ .,
   data       = rsf_data,
   ntree      = 1000,
+  splitrule  = "logrank",
   importance = TRUE,
   ntime      = 100,
   seed       = 42
 )
 
-print(rsf_fit)  # OOB C-index — >0.6 is reasonable, >0.7 is good
+cat("Stage 1 OOB C-index:",
+    round(1 - tail(rsf_fit$err.rate, 1), 4), "\n")
 
-# ── 2. Variable importance ────────────────────────────────────────────────────
+saveRDS(rsf_fit, "rsf_fit_stage1.rds")
+rsf_fit <- readRDS("rsf_fit_stage1.rds")
+
+# ── 2. Stage 1 variable importance + plot ─────────────────────────────────────
 vimp <- sort(rsf_fit$importance, decreasing = TRUE)
+
 par(mar = c(4, 10, 3, 1))
-barplot(rev(vimp[1:15]),
-        horiz   = TRUE,
-        las     = 1,
-        col     = "steelblue",
-        main    = "RSF Variable Importance: Top 15 Leiden Cell Types",
-        xlab    = "VIMP")
+barplot(
+  rev(vimp[1:15]),
+  horiz = TRUE,
+  las   = 1,
+  col   = "#3288BD",
+  main  = "RSF Variable Importance: Top 15 MetaClusters (Stage 1)",
+  xlab  = "VIMP"
+)
 
-# ── 3. Minimal depth (interaction structure) ──────────────────────────────────
-md_obj <- max.subtree(rsf_fit)
-print(md_obj$order[1:15, ])  # lower depth = stronger role in interactions
+cat("Stage 1 VIMP (top 20):\n")
+print(head(vimp, 20))
 
-# Minimal depth interaction matrix
-md_obj <- max.subtree(rsf_fit, sub.order = TRUE)
+# Keep only features with VIMP > 0 (positive contribution)
+vars_vimp_pos <- names(vimp)[vimp > 0]
+cat("Stage 1: variables with VIMP > 0:", length(vars_vimp_pos), "\n")
 
-# Print the interaction table (lower value = stronger interaction)
-print(round(md_obj$sub.order, 2))
+rsf_data_filtered <- rsf_data[, c("dfs_months", "dfs_event", vars_vimp_pos)]
 
-sub_order <- md_obj$sub.order
-sub_df <- melt(sub_order)
-colnames(sub_df) <- c("Var1", "Var2", "MinDepth")
+# ── 3. Stage 2 RSF fit on VIMP>0 vars ────────────────────────────────────────
+set.seed(42)
+rsf_fit_v2 <- rfsrc(
+  Surv(dfs_months, dfs_event) ~ .,
+  data       = rsf_data_filtered,
+  ntree      = 1000,
+  splitrule  = "logrank",
+  importance = TRUE,
+  ntime      = 100,
+  seed       = 42
+)
 
-ggplot(sub_df, aes(x = Var1, y = Var2, fill = MinDepth)) +
-  geom_tile() +
-  scale_fill_gradient(low = "red", high = "white",
-                      name = "Min Depth\n(lower = stronger)") +
-  theme_minimal() +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
-  labs(title = "Leiden Cell Type Pairwise Interactions (Minimal Depth)",
-       x = "", y = "")
+cat("Stage 2 OOB C-index:",
+    round(1 - tail(rsf_fit_v2$err.rate, 1), 4), "\n")
 
-###no interactions interestingly
+saveRDS(rsf_fit_v2, "rsf_fit_v2.rds")
+rsf_fit_v2 <- readRDS("rsf_fit_v2.rds")
+
+# ── 4. Risk scoring from final RSF ────────────────────────────────────────────
+# rfsrc silently drops NA outcome rows — align survival_df to model rows
+dfs_complete <- !is.na(rsf_data_filtered$dfs_months) &
+                !is.na(rsf_data_filtered$dfs_event)
+
+survival_df            <- as.data.frame(rsf_data_filtered[dfs_complete, ])
+survival_df$rsf_risk   <- rsf_fit_v2$predicted
+survival_df$patient_id <- merged_df$patient_id[which(dfs_complete)]
+
+cat("Rows in survival_df:", nrow(survival_df), "\n")
+
+# ── 5. Stage 2 variable importance + plot + top 15 names ─────────────────────
+vimp2 <- sort(rsf_fit_v2$importance, decreasing = TRUE)
+
+par(mar = c(4, 10, 3, 1))
+barplot(
+  rev(vimp2[1:15]),
+  horiz = TRUE,
+  las   = 1,
+  col   = "#3288BD",
+  main  = "RSF Variable Importance: Top 15 MetaClusters (Stage 2)",
+  xlab  = "VIMP"
+)
+
+cat("Stage 2 VIMP (top 20):\n")
+print(head(vimp2, 20))
+
+top_vars <- names(vimp2)[1:15]
+cat("Stage 2: top 15 variables retained:\n")
+print(top_vars)
+```
+
+
+```{r}
 # ── Rebuild rsf_data: drop only on dfs NAs ────────────────────────────────────
 survival_complete <- !is.na(merged_df$dfs_months) & !is.na(merged_df$dfs_event)
 rsf_data <- merged_df[survival_complete, c("dfs_months", "dfs_event", leiden_cols_filtered)]
 
-# Verify
-cat("rsf_data rows:", nrow(rsf_data), "\n")  # should now be 267
-cat("rsf_fit n:    ", rsf_fit$n, "\n")       # 267 — must match
-#Build survival_df with risk score
-survival_df          <- rsf_data
+cat("rsf_data rows:", nrow(rsf_data), "\n")
+cat("rsf_fit n:    ", rsf_fit$n, "\n")
+
+# ── Build survival_df with in-bag risk score (inference goal: stratify cohort) 
+survival_df          <- as.data.frame(rsf_data)
 survival_df$rsf_risk <- predict(rsf_fit, newdata = rsf_data)$predicted
 
-# ── Check what's actually in survival_df ─────────────────────────────────────
-colnames(survival_df)  # is rsf_risk in there?
-nrow(survival_df)      # should be 267
+# ── Justify number of groups ──────────────────────────────────────────────────
+logrank_results <- sapply(2:5, function(k) {
+  tmp <- data.frame(dfs_months = survival_df$dfs_months,
+                    dfs_event  = survival_df$dfs_event,
+                    grp        = factor(ntile(survival_df$rsf_risk, k)))
+  survdiff(Surv(dfs_months, dfs_event) ~ grp, data = tmp)$chisq
+})
+names(logrank_results) <- paste0(2:5, " groups")
+print(round(logrank_results, 3))
 
-preds <- predict(rsf_fit, newdata = rsf_data)$predicted
-survival_df <- as.data.frame(rsf_data)
-survival_df$rsf_risk <- preds
+cox2 <- coxph(Surv(dfs_months, dfs_event) ~ ntile(rsf_risk, 2), data = survival_df)
+cox3 <- coxph(Surv(dfs_months, dfs_event) ~ ntile(rsf_risk, 3), data = survival_df)
+cox4 <- coxph(Surv(dfs_months, dfs_event) ~ ntile(rsf_risk, 4), data = survival_df)
+print(AIC(cox2, cox3, cox4))
+anova(cox2, cox3, test = "Chisq")
+anova(cox3, cox4, test = "Chisq")
 
-cat("rsf_risk exists:", "rsf_risk" %in% colnames(survival_df), "\n")  # TRUE
-# ── Now the histogram is ready to run ─────────────────────────────────────────
-# ── Histogram of RSF risk score distribution ──────────────────────────────────
-ggplot(survival_df, aes(x = rsf_risk)) +
-  geom_histogram(bins = 30, fill = "steelblue", colour = "white", alpha = 0.8) +
-  geom_vline(xintercept = quantile(survival_df$rsf_risk, probs = c(1/3, 2/3)),
-             linetype = "dashed", colour = "orange", linewidth = 0.8) +
-  geom_vline(xintercept = quantile(survival_df$rsf_risk, probs = c(0.25, 0.5, 0.75)),
-             linetype = "dotted", colour = "red", linewidth = 0.8) +
-  annotate("text", x = quantile(survival_df$rsf_risk, 1/3), 
-           y = Inf, label = "Tertile 1", vjust = 2, hjust = 1.1, 
-           colour = "orange", size = 3.5) +
-  annotate("text", x = quantile(survival_df$rsf_risk, 2/3), 
-           y = Inf, label = "Tertile 2", vjust = 2, hjust = 1.1, 
-           colour = "orange", size = 3.5) +
-  annotate("text", x = quantile(survival_df$rsf_risk, 0.5), 
-           y = Inf, label = "Median", vjust = 4, hjust = -0.1, 
-           colour = "red", size = 3.5) +
-  labs(title = "RSF Risk Score Distribution",
-       subtitle = "Orange dashed = tertile cuts | Red dotted = quartile cuts",
-       x = "RSF Predicted Risk Score", y = "Count") +
-  theme_minimal()
+# ── Create risk groups ────────────────────────────────────────────────────────
+# Find optimal cutpoints for up to 3 groups
+cut_res <- surv_cutpoint(survival_df,
+                         time      = "dfs_months",
+                         event     = "dfs_event",
+                         variables = "rsf_risk",
+                         minprop   = 0.15)   # ensures no group < 15% of patients
+summary(cut_res)
+plot(cut_res, "rsf_risk")  
+table(surv_categorize(cut_res)$rsf_risk)
 
-# ── 5. Risk score + KM plot ───────────────────────────────────────────────────
-merged_df$rsf_risk  <- predict(rsf_fit, newdata = rsf_data)$predicted
-merged_df$risk_grp  <- ifelse(
-  merged_df$rsf_risk > median(merged_df$rsf_risk), "High", "Low"
-)
+# ── Step 1: categorise patients using the optimal cutpoint ────────────────────
+categorized        <- surv_categorize(cut_res)
+survival_df$risk_grp <- factor(categorized$rsf_risk,
+                                levels = c("low", "high"),
+                                labels = c("Low", "High"))
 
-km_fit <- survfit(Surv(dfs_months, dfs_event) ~ risk_grp, data = merged_df)
+# ── Step 2: confirm unequal groups ───────────────────────────────────────────
+table(survival_df$risk_grp)   # should NOT be equal
 
-ggsurvplot(
-  km_fit,
-  data       = merged_df,
-  pval       = TRUE,
-  risk.table = TRUE,
-  xlab       = "Time (months)",
-  ylab       = "Disease-Free Survival",
-  title      = "DFS: RSF-derived Leiden Abundance Risk Groups",
-  palette    = c("#E7298A", "#1B9E77"),
-  legend.labs = c("High Risk", "Low Risk")
-)
+saveRDS(survival_df, "survival_df_with_risk.rds")
+survival_df <-readRDS("survival_df_with_risk.rds")
 
+# ── Step 3: re-fit KM with new groups ────────────────────────────────────────
+km_fit <- survfit(Surv(dfs_months, dfs_event) ~ risk_grp, data = survival_df)
 
-### se what it looks like surivival wise
-# ── 3 groups ──────────────────────────────────────────────────────────────────
-survival_df$risk_grp3 <- cut(
-  survival_df$rsf_risk,
-  breaks         = quantile(survival_df$rsf_risk, probs = c(0, 1/3, 2/3, 1)),
-  labels         = c("Low", "Mid", "High"),
-  include.lowest = TRUE
-)
-table(survival_df$risk_grp3)  # ~89 per group
-
-# ── 4 groups ──────────────────────────────────────────────────────────────────
-survival_df$risk_grp4 <- cut(
-  survival_df$rsf_risk,
-  breaks         = quantile(survival_df$rsf_risk, probs = c(0, 0.25, 0.5, 0.75, 1)),
-  labels         = c("Q1", "Q2", "Q3", "Q4"),
-  include.lowest = TRUE
-)
+# ── Step 4: plot ──────────────────────────────────────────────────────────────
+ggsurvplot(km_fit, data = survival_df,
+           pval         = TRUE,
+           pval.method  = TRUE,
+           pval.size =3,
+           risk.table   = TRUE,
+           conf.int     = FALSE,
+           palette      = c("#4DAF6E", "#C0392B"),
+           legend.labs  = c("Low", "High"),
+           legend.title = "Risk Group",
+           xlab         = "Time (months)",
+           ylab         = "Disease-Free Survival Probability",
+           title        = "DFS: RSF-Derived Risk Groups",
+           risk.table.height = 0.25,
+           ggtheme      = theme_minimal())
+```
 
 
-table(survival_df$risk_grp4) 
 
+```{r}
+cat("\n═══════════════════════════════════════════════════════\n")
+cat("=== MODEL PERFORMANCE ===\n")
+cat("═══════════════════════════════════════════════════════\n")
 
-#km plots
-km3 <- survfit(Surv(dfs_months, dfs_event) ~ risk_grp3, data = survival_df)
-ggsurvplot(km3, data = survival_df, pval = TRUE, risk.table = TRUE,
-           palette     = c("#1B9E77", "#D95F02", "#E7298A"),
-           legend.labs = c("Low", "Mid", "High"),
-           xlab        = "Time (months)",
-           title       = "DFS: 3 Risk Groups")
-km4 <- survfit(Surv(dfs_months, dfs_event) ~ risk_grp4, data = survival_df)
+# C-index: 1 - OOB error rate
+c_index_oob <- 1 - tail(rsf_fit_final$err.rate, 1)
 
-ggsurvplot(
-  km4,
-  data        = survival_df,
-  pval        = TRUE,
-  pval.method = TRUE,
-  risk.table  = TRUE,
-  conf.int    = FALSE,
-  xlab        = "Time (months)",
-  ylab        = "Disease-Free Survival Probability",
-  title       = "DFS by RSF-Derived Risk Groups (Quartiles)",
-  legend.title = "Risk Group",
-  legend.labs = c("Q1 Low", "Q2 Mid-Low", "Q3 Mid-High", "Q4 High"),
-  palette     = c("#1B9E77", "#7FC97F", "#D95F02", "#E7298A"),
-  risk.table.height = 0.28,
-  ggtheme     = theme_minimal()
-)
+# Standardised CRPS: on 0-0.25 scale (integrated Brier score / time)
+# Extracted directly from model print output
+rsf_summary     <- capture.output(print(rsf_fit_final))
+crps_std_line   <- rsf_summary[grep("standardized CRPS", rsf_summary)]
+crps_std        <- as.numeric(trimws(sub(".*:", "", crps_std_line)))
+
+cat("OOB C-index:                        ", round(c_index_oob, 4), "\n")
+cat("Standardised CRPS (IBS / time):     ", round(crps_std, 4),    "\n")
+
+cat("\n═══════════════════════════════════════════════════════\n")
+cat("=== END OF REPORTING OUTPUT ===\n")
+cat("═══════════════════════════════════════════════════════\n")
+
+print(rsf_fit_final)
 ```
 ```{r}
-# ══════════════════════════════════════════════════════════════════════════════
-# FULL REPORTING OUTPUT (3 GROUPS) 
-# ══════════════════════════════════════════════════════════════════════════════
+####nicer VIMP plot
+jk_vimp <- subsample(rsf_fit, B = 100)
 
-cat("=== METHODS: RSF MODEL SPECIFICATION ===\n")
-cat("Number of trees:", rsf_fit$ntree, "\n")
-cat("mtry:", rsf_fit$mtry, "\n")
-cat("nodesize:", rsf_fit$nodesize, "\n")
-cat("Training sample size:", rsf_fit$n, "\n")
-cat("Number of events:", rsf_fit$ndead, "\n")
-cat("Total Leiden columns before filtering:", length(leiden_cols), "\n")
-cat("Columns removed (>99.99% zeros):", sum(zero_frac > 0.9999), "\n")
-cat("Columns retained for analysis:", length(leiden_cols_filtered), "\n")
+par(oma = c(0.5, 10, 0.5, 0.5))
+par(cex.axis = 1.2, cex.lab = 1.2, cex.main = 1.5,
+    mar = c(6.0, 17, 1, 1), mgp = c(4, 1, 0))
+plot(jk_vimp,
+     xlab   = "Variable Importance",
+     cex    = 1.2,
+     sorted = FALSE,
+     nvar   = nrow(jk_vimp$var.jk.sel.Z))
 
-cat("\n=== METHODS: GROUP ALLOCATION ===\n")
-cuts3 <- quantile(survival_df$rsf_risk, probs = c(0, 1/3, 2/3, 1))
-cat("Tertile cut points:\n"); print(round(cuts3, 4))
-cat("\nGroup sizes:\n"); print(table(survival_df$risk_grp3))
-cat("\nEvents per group:\n")
-etab3 <- table(survival_df$risk_grp3, survival_df$dfs_event)
-colnames(etab3) <- c("Censored", "Event")
-print(etab3)
+args(randomForestSRC:::plot.subsample)
+```
 
-cat("\n=== RESULTS: MODEL PERFORMANCE ===\n")
-c_index <- 1 - rsf_fit$err.rate[rsf_fit$ntree]
-cat("OOB C-index:", round(c_index, 3), "\n")
 
-cat("\n=== RESULTS: TOP 10 VARIABLE IMPORTANCE ===\n")
-vimp_df <- data.frame(
-  leiden_col = names(rsf_fit$importance),
-  VIMP       = round(rsf_fit$importance, 5)
-) |> dplyr::arrange(desc(VIMP))
-print(head(vimp_df, 10))
 
-cat("\n=== RESULTS: LOG-RANK TEST ===\n")
-lr_test <- survdiff(Surv(dfs_months, dfs_event) ~ risk_grp3, data = survival_df)
-p_exact <- 1 - pchisq(lr_test$chisq, df = 2)
-cat("Chi-squared:", round(lr_test$chisq, 3), "\n")
-cat("Degrees of freedom: 2\n")
-cat("Log-rank p-value:", format(p_exact, scientific = TRUE), "\n")
+```{r}
+##CRPS value and plot#
+# ── Get Brier scores for KM and RSF censoring models ─────────────────────────
+bs_km  <- get.brier.survival(rsf_fit_final, cens.mode = "km")$brier.score
+bs_rsf <- get.brier.survival(rsf_fit_final, cens.mode = "rfsrc")$brier.score
 
-cat("\n=== RESULTS: MEDIAN SURVIVAL PER GROUP ===\n")
-km3 <- survfit(Surv(dfs_months, dfs_event) ~ risk_grp3, data = survival_df)
-print(summary(km3)$table[, c("records", "events", "median", "0.95LCL", "0.95UCL")])
+# Use each model's own time column directly
+time_km  <- bs_km[, 1]
+time_rsf <- bs_rsf[, 1]
 
-cat("\n=== RESULTS: COX HR FOR CONTINUOUS RISK SCORE ===\n")
-cox_cont <- coxph(Surv(dfs_months, dfs_event) ~ rsf_risk, data = survival_df)
-print(summary(cox_cont)$coefficients)
-print(summary(cox_cont)$conf.int)
+cat("KM time range: ",  round(range(time_km),  1), "\n")
+cat("RSF time range:", round(range(time_rsf), 1), "\n")
 
-cat("\n=== END OF REPORTING OUTPUT ===\n")
+# ── Calculate CRPS at every time point ───────────────────────────────────────
+trapz <- randomForestSRC:::trapz
+
+crps_km  <- sapply(2:nrow(bs_km), function(j) {
+  trapz(time_km[1:j],  bs_km[1:j,  2] / diff(range(time_km[1:j])))
+})
+crps_rsf <- sapply(2:nrow(bs_rsf), function(j) {
+  trapz(time_rsf[1:j], bs_rsf[1:j, 2] / diff(range(time_rsf[1:j])))
+})
+
+# ── Plot ──────────────────────────────────────────────────────────────────────
+plot(time_km[-1],  crps_km,
+     type = "s", col = "#D95F02", lwd = 2,
+     ylab = "CRPS", xlab = "Time (months)",
+     main = "CRPS: RSF vs Null (KM) Model",
+     ylim = range(c(crps_km, crps_rsf)))
+lines(time_rsf[-1], crps_rsf,
+      type = "s", col = "#1B9E77", lwd = 2)
+legend("bottomright",
+       legend = c("Null (KM)", "RSF"),
+       col    = c("#D95F02", "#1B9E77"),
+       lty = 1, lwd = 2)
+```
+
+
+
+
+
+```{r}
+# ═══════════════════════════════════════════════════════════
+# === SURVIVAL + BRIER SCORE PLOTS (CAPPED AT 120 MONTHS) ===
+# ═══════════════════════════════════════════════════════════
+
+MAX_TIME <- 120
+
+# ── 1. KM survival plot (correct risk groups, capped at 120) ──
+km_fit_cap <- survfit(Surv(dfs_months, dfs_event) ~ risk_grp, 
+                      data = survival_df)
+
+p1 <- ggsurvplot(km_fit_cap, data = survival_df,
+           xlim             = c(0, MAX_TIME),
+           break.time.by    = 20,
+           pval             = TRUE,
+           pval.method      = TRUE,
+           pval.size        = 3,
+           risk.table       = TRUE,
+           conf.int         = FALSE,
+           palette          = c("#1B9E77", "#E7298A"),
+           legend.labs      = c("Low", "High"),
+           legend.title     = "Risk Group",
+           xlab             = "Time (months)",
+           ylab             = "Disease-Free Survival Probability",
+           title            = "DFS: RSF-Derived Risk Groups (capped at 120 months)",
+           risk.table.height = 0.25,
+           ggtheme          = theme_minimal())
+print(p1)
+
+# ── 2. Brier score plot (ggplot2 to avoid device conflict) ─
+
+
+bs_km  <- get.brier.survival(rsf_fit_final, cens.mode = "km")
+bs_rsf <- get.brier.survival(rsf_fit_final, cens.mode = "rfsrc")
+
+bs_km_df  <- as.data.frame(bs_km$brier.score)
+bs_rsf_df <- as.data.frame(bs_rsf$brier.score)
+
+bs_km_cap  <- bs_km_df[bs_km_df[, 1]  <= MAX_TIME, ]
+bs_rsf_cap <- bs_rsf_df[bs_rsf_df[, 1] <= MAX_TIME, ]
+
+brier_plot_df <- rbind(
+  data.frame(time = bs_km_cap[, 1],  brier = bs_km_cap[, 2],  model = "KM (null)"),
+  data.frame(time = bs_rsf_cap[, 1], brier = bs_rsf_cap[, 2], model = "RSF")
+)
+
+ggplot(brier_plot_df, aes(x = time, y = brier, colour = model)) +
+  geom_step(linewidth = 0.8) +
+  geom_hline(yintercept = 0.25, linetype = "dashed", colour = "grey50") +
+  annotate("text", x = MAX_TIME * 0.7, y = 0.255,
+           label = "Random guessing (0.25)", colour = "grey40", size = 3) +
+  scale_colour_manual(values = c("KM (null)" = "#E7298A", "RSF" = "#1B9E77")) +
+  scale_x_continuous(limits = c(0, MAX_TIME), breaks = seq(0, MAX_TIME, 20)) +
+  scale_y_continuous(limits = c(0, 0.25)) +
+  labs(x = "Time (months)", y = "Brier Score",
+       title = "Brier Score: RSF vs Null KM (capped at 120 months)",
+       colour = NULL) +
+  theme_minimal()
+
 ```
 
 ```{r}
