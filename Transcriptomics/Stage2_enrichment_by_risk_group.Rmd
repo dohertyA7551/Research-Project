@@ -1,0 +1,945 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(survival)
+library(coxphf)
+library(purrr)
+library(glmnet)
+library(readr)
+library(broom)
+library(survminer)
+library(stringr)
+library(tidyr)
+library(tibble)
+library(umap)
+library(limma)
+library(knitr)
+library(EnhancedVolcano)
+library(pheatmap)
+```
+
+```{r load-data}
+# Resolve paths whether knitting from Transcriptomics/ or parent files/
+if (file.exists("Stage2_transcriptomics_xcell.csv")) {
+  base_dir       <- "."
+  proteomics_dir <- "../proteomics"
+  spatial_dir    <- "../spatial"
+} else if (file.exists("Transcriptomics/Stage2_transcriptomics_xcell.csv")) {
+  base_dir       <- "Transcriptomics"
+  proteomics_dir <- "proteomics"
+  spatial_dir    <- "spatial"
+} else {
+  stop(
+    "Cannot locate Stage2_transcriptomics_xcell.csv. ",
+    "Knit from Transcriptomics/ or its parent directory."
+  )
+}
+
+helpers_path <- file.path(base_dir, "analysis_helpers.R")
+if (!file.exists(helpers_path)) {
+  stop("Missing analysis_helpers.R in ", base_dir)
+}
+source(helpers_path)
+dirs <- setup_analysis_dirs(base_dir, "stage2")
+output_dir <- dirs$output_dir
+
+original_files <- c(
+  xCell2 scores      = file.path(base_dir, "Stage2_transcriptomics_xcell.csv"),
+  clinical data      = file.path(base_dir, "stage2/clinical.csv"),
+  patient mapping    = file.path(spatial_dir, "master_patient_mapping.csv"),
+  survival with risk = file.path(proteomics_dir, "survival_df_with_risk.rds"),
+  ge clinical        = file.path(base_dir, "stage2/ge_project_rcsi_cohort_clinical.csv")
+)
+missing <- names(original_files)[!file.exists(original_files)]
+if (length(missing) > 0) {
+  stop(
+    "Missing required original file(s):\n",
+    paste0("  - ", missing, ": ", original_files[missing], collapse = "\n"),
+    "\n\nRegenerate survival_df_with_risk.rds by running ",
+    "proteomics/RCSI_Taxonomy_Combined_prognosis_scores.Rmd."
+  )
+}
+
+# Read only from working copies — originals are never modified
+working_files <- ensure_working_copies(original_files, dirs$work_dir)
+xcell_path    <- working_files[[1]]
+clinical_path <- working_files[[2]]
+mapping_path  <- working_files[[3]]
+survival_path <- working_files[[4]]
+ge_clin_path  <- working_files[[5]]
+
+stage2_res <- read_csv(xcell_path, show_col_types = FALSE)
+clinical   <- read_csv(clinical_path, show_col_types = FALSE)
+master_patient_mapping <- read_csv(mapping_path, show_col_types = FALSE)
+survival_df_with_risk  <- readRDS(survival_path)
+ge_project_rcsi_cohort_clinical <- read_csv(ge_clin_path, show_col_types = FALSE)
+
+survival_df  <- survival_df_with_risk
+surivival_df <- survival_df_with_risk
+stage2       <- stage2_res
+
+cat("Loaded", nrow(stage2_res) - 1, "cell types x", ncol(stage2_res) - 1, "samples\n")
+cat("Risk groups in survival data:", paste(names(table(survival_df$risk_grp)), collapse = ", "), "\n")
+```
+
+
+```{r}
+#### ok step 1 for stage 2 dataset is map r ids onto T ids
+# Create the r_code mapping row
+# Do the T-ids actually exist in clinical$patient_id?
+head(colnames(stage2)[-1])      # what do your T-ids look like exactly?
+head(clinical$patient_id)           # what do patient_ids look like in clinical?
+
+# How many T-ids from stage2_res are found in clinical?
+sum(colnames(stage2)[-1] %in% clinical$patient_id)
+
+# Which ones are NOT found?
+colnames(stage2)[-1][!colnames(stage2)[-1] %in% clinical$patient_id]
+
+r_codes <- clinical$r_code[match(colnames(stage2)[-1], clinical$patient_id)]
+
+# Preview the mapping before doing anything else
+data.frame(
+  t_id   = colnames(stage2)[-1],
+  r_code = r_codes
+)
+
+# Build new row with "r_code" label in first column
+new_row <- data.frame(t(c("r_code", r_codes)))
+colnames(new_row) <- colnames(stage2)
+
+# Add on top
+stage2_with_rcodes <- rbind(new_row, stage2)
+
+# Check
+stage2_with_rcodes[1:3, 1:5]
+
+head(master_patient_mapping[, c("r_code", "patient_id_g")])
+
+# Map r_codes in stage2 columns to patient_id_g
+patient_id_g <- master_patient_mapping$patient_id_g[match(r_codes, master_patient_mapping$r_code)]
+
+# Build the new row
+patient_id_g_row <- data.frame(t(c("patient_id_g", patient_id_g)))
+colnames(patient_id_g_row) <- colnames(stage2)
+
+# Add on top of stage2_with_rcodes (which already has r_code row on top)
+stage2_with_rcodes <- rbind(patient_id_g_row, stage2_with_rcodes)
+
+# Check - should now have patient_id_g row first, r_code row second
+stage2_with_rcodes[1:4, 1:5]
+
+# How many are NA?
+sum(is.na(patient_id_g))
+
+# Which T-ids didn't find a matching G-id?
+data.frame(
+  t_id   = colnames(stage2)[-1],
+  r_code = r_codes,
+  patient_id_g = patient_id_g
+)[is.na(patient_id_g), ]
+
+sum(!is.na(patient_id_g))
+na_idx <- is.na(patient_id_g)
+
+###fill nas from other dataset
+# Try to map those r_codes using the new dataset
+patient_id_g_fill <- ge_project_rcsi_cohort_clinical$patient_id[
+  match(r_codes[na_idx], ge_project_rcsi_cohort_clinical$r_code)
+]
+
+# Preview what we recovered
+data.frame(
+  r_code       = r_codes[na_idx],
+  patient_id_g = patient_id_g_fill
+)
+
+# See exactly which r_codes are still unmatched
+still_missing <- data.frame(
+  t_id   = colnames(stage2)[-1][is.na(patient_id_g)],
+  r_code = r_codes[is.na(patient_id_g)]
+)
+print(still_missing)
+
+
+# Are they in master_patient_mapping?
+still_missing$r_code %in% master_patient_mapping$r_code
+
+# Are they in ge_project_rcsi_cohort_clinical?
+still_missing$r_code %in% ge_project_rcsi_cohort_clinical$r_code
+```
+```{r}
+#now finally get onto something relevant
+
+colnames(surivival_df)
+
+# ── Rebuild r_code and patient_id_g rows ─────────────────
+r_code_row       <- data.frame(t(c("r_code",       r_codes)))
+patient_id_g_row <- data.frame(t(c("patient_id_g", patient_id_g)))
+colnames(r_code_row)       <- colnames(stage2)
+colnames(patient_id_g_row) <- colnames(stage2)
+
+stage2_with_ids <- rbind(patient_id_g_row, r_code_row, stage2)
+
+# ── Map risk groups using ifelse to force text labels ─────
+risk_groups <- ifelse(
+  patient_id_g %in% surivival_df$patient_id,
+  as.character(surivival_df$risk_grp)[match(patient_id_g, surivival_df$patient_id)],
+  NA
+)
+
+# Verify labels before adding row
+table(risk_groups, useNA = "always")
+
+# ── Add risk group row ────────────────────────────────────
+risk_row <- data.frame(t(c("risk_grp", risk_groups)))
+colnames(risk_row) <- colnames(stage2)
+
+stage2_with_ids <- rbind(risk_row, stage2_with_ids)
+
+# ── Verify ────────────────────────────────────────────────
+as.character(stage2_with_ids[1, 1:10])
+
+table(risk_groups, useNA = "always")
+```
+
+```{r build-id-map-scores-long}
+# Sample (T-tube) to patient mapping for downstream joins
+sample_ids <- colnames(stage2)[-1]
+t_ids <- sample_ids
+g_ids <- patient_id_g
+
+id_map <- data.frame(
+  t_id = t_ids,
+  g_id = g_ids,
+  stringsAsFactors = FALSE
+)
+
+# Long-format enrichment scores with risk annotation (mapped High/Low only)
+scores_long <- stage2_res %>%
+  rename(cell_type = 1) %>%
+  pivot_longer(-cell_type, names_to = "sample", values_to = "enrichment") %>%
+  left_join(
+    id_map %>% rename(sample = t_id, patient_id = g_id),
+    by = "sample"
+  ) %>%
+  left_join(
+    survival_df %>% select(patient_id, risk_grp, rsf_risk),
+    by = "patient_id"
+  ) %>%
+  filter(risk_grp %in% c("Low", "High"))
+
+cat("scores_long rows:", nrow(scores_long), "\n")
+cat("Samples with risk group:\n")
+print(table(scores_long$sample, scores_long$risk_grp))
+
+# High vs Low differential enrichment (Wilcoxon per cell type)
+differential_results <- scores_long %>%
+  group_by(cell_type) %>%
+  summarise(
+    mean_high = mean(enrichment[risk_grp == "High"], na.rm = TRUE),
+    mean_low  = mean(enrichment[risk_grp == "Low"], na.rm = TRUE),
+    log2FC    = log2((mean_high + 1e-10) / (mean_low + 1e-10)),
+    pval      = wilcox.test(enrichment ~ risk_grp)$p.value,
+    .groups   = "drop"
+  ) %>%
+  mutate(neg_log10_p = -log10(pval))
+
+print(differential_results %>%
+        filter(cell_type %in% c("B cell", "Exhausted CD8+ T cells")))
+```
+
+```{r export-top-log2fc}
+top_fc_table <- export_top_log2fc_table(
+  differential_results,
+  file.path(output_dir, "Stage2_top5_log2fc_up_down.csv")
+)
+print(top_fc_table)
+```
+
+```{r}
+
+###compare enrichment scores between groups
+
+library(EnhancedVolcano)
+
+# Step 1: Clean infinite and NA log2FC values
+differential_results_clean <- differential_results[
+  is.finite(differential_results$log2FC) & !is.na(differential_results$pval), 
+]
+
+# Step 2: Check how many rows remain
+nrow(differential_results_clean)
+
+# Step 3: Plot
+suppressWarnings(
+  EnhancedVolcano(
+    differential_results_clean,
+    lab       = differential_results_clean$cell_type,
+    x         = "log2FC",
+    y         = "pval",
+    pCutoff   = 0.05,
+    FCcutoff  = 0.5,
+    title     = "Cell Type Enrichment: High vs Low Risk",
+    subtitle  = "Stage 2 Transcriptomics | xCell2 scores",
+    xlab      = "Log2 Fold Change (High / Low)",
+    ylab      = "-Log10(p-value)",
+    pointSize = 2.0,
+    labSize   = 3.0
+  )
+)
+
+
+
+differential_results_clean[order(abs(differential_results_clean$log2FC), decreasing = TRUE), 
+                            c("cell_type", "log2FC", "pval")]
+```
+```{r}
+volcano_axes <- volcano_axis_limits(differential_results_clean)
+
+suppressWarnings({
+  p_test <- EnhancedVolcano(
+    differential_results_clean,
+    lab       = differential_results_clean$cell_type,
+    x         = "log2FC",
+    y         = "pval",
+    pCutoff   = 0.05001,
+    FCcutoff  = 0.5,
+    title     = "Cell Type Enrichment: High vs Low Risk",
+    subtitle  = "Stage 2 Transcriptomics | xCell2 scores",
+    xlab      = "Log2 Fold Change (High / Low)",
+    ylab      = "-Log10(p-value)",
+    pointSize = 2.0,
+    labSize   = 3.5,
+    drawConnectors        = TRUE,
+    widthConnectors       = 0.4,
+    maxoverlapsConnectors = Inf,
+    xlim = volcano_axes$xlim,
+    ylim = volcano_axes$ylim
+  ) +
+  ggplot2::theme(
+    plot.margin     = ggplot2::margin(20, 60, 20, 60),
+    legend.position = "bottom"
+  )
+
+  print(p_test)
+})
+# find the CD8 row
+differential_results_clean[grep("CD8", differential_results_clean$cell_type), ]
+differential_results_clean[grep("CD8", differential_results_clean$cell_type), "pval"]
+
+print(differential_results_clean)
+diff_pos_fc <- differential_results_clean[
+  order(differential_results_clean$log2FC, decreasing = TRUE),
+]
+head(diff_pos_fc, 10)
+
+# Keep only rows with negative log2 fold change
+diff_neg_fc <- differential_results_clean[
+  differential_results_clean$log2FC < 0,
+]
+
+# Order by log2FC ascending (most negative first)
+diff_neg_fc <- diff_neg_fc[
+  order(diff_neg_fc$log2FC, decreasing = FALSE),
+]
+
+# Take the top 5 most negative
+top5_neg_fc <- head(diff_neg_fc, 5)
+
+print(top5_neg_fc)
+
+```
+
+
+```{r}
+library(ggplot2)
+library(ggrepel)
+
+# Assign significance category
+df <- differential_results_clean
+df$sig <- "NS"
+df$sig[abs(df$log2FC) > 0.5] <- "Log2 FC"
+df$sig[df$pval < 0.05001 & abs(df$log2FC) > 0.5] <- "p-value and log2 FC"
+df$sig[df$pval < 0.05001 & abs(df$log2FC) <= 0.5] <- "p-value"
+
+# Assign numbers only to coloured (non-NS) points
+df$label_num <- NA
+coloured <- df$sig != "NS"
+df$label_num[coloured] <- seq_len(sum(coloured))
+
+# Colour map
+col_map <- c(
+  "NS"                  = "grey60",
+  "Log2 FC"             = "#00b050",
+  "p-value"             = "#4472c4",
+  "p-value and log2 FC" = "#ff0000"
+)
+
+p_test <- ggplot(df, aes(x = log2FC, y = -log10(pval), colour = sig)) +
+  geom_point(size = 2) +
+  geom_hline(yintercept = -log10(0.05001), linetype = "dashed", colour = "black") +
+  geom_vline(xintercept = c(-0.5, 0.5), linetype = "dashed", colour = "black") +
+  geom_text(aes(label = label_num), colour = "black", size = 3, vjust = -0.8, na.rm = TRUE) +
+  scale_colour_manual(values = col_map, name = "Significance") +
+  scale_x_continuous(limits = volcano_axes$xlim) +
+  scale_y_continuous(limits = volcano_axes$ylim) +
+  labs(
+    title    = "Cell Type Enrichment: High vs Low Risk",
+    subtitle = "Stage 2 Transcriptomics | xCell2 scores",
+    x        = "Log2 Fold Change (High / Low)",
+    y        = "-Log10(p-value)"
+  ) +
+  # Number legend on the right
+  annotate("text",
+    x = 2.05,
+    y = seq(max(-log10(df$pval), na.rm = TRUE) + 0.3,
+            max(-log10(df$pval), na.rm = TRUE) + 0.3 - (sum(coloured)-1)*0.15,
+            length.out = sum(coloured)),
+    label = paste0(df$label_num[coloured], ": ", df$cell_type[coloured]),
+    hjust = 0, size = 2.5, colour = "black"
+  ) +
+  theme_classic() +
+  theme(
+    plot.margin    = ggplot2::margin(20, 200, 20, 20),
+    legend.position = "bottom"
+  )
+
+print(p_test)
+```
+```{r}
+library(ggplot2)
+library(cowplot)
+
+# Build legend text
+legend_labels <- paste0(df$label_num[coloured], ": ", df$cell_type[coloured])
+legend_text <- paste(legend_labels, collapse = "\n")
+
+# Main plot
+p_main <- ggplot(df, aes(x = log2FC, y = -log10(pval), colour = sig)) +
+  geom_point(size = 2) +
+  geom_hline(yintercept = -log10(0.05001), linetype = "dashed", colour = "black") +
+  geom_vline(xintercept = c(-0.5, 0.5), linetype = "dashed", colour = "black") +
+  geom_text(aes(label = label_num), colour = "black", size = 3, vjust = -0.8, na.rm = TRUE) +
+  scale_colour_manual(values = col_map, name = "Significance") +
+  scale_x_continuous(limits = volcano_axes$xlim) +
+  scale_y_continuous(limits = volcano_axes$ylim) +
+  labs(
+    title    = "Cell Type Enrichment: High vs Low Risk",
+    subtitle = "Stage 2 Transcriptomics | xCell2 scores",
+    x        = "Log2 Fold Change (High / Low)",
+    y        = "-Log10(p-value)"
+  ) +
+  theme_classic() +
+  theme(legend.position = "bottom")
+
+# Side legend panel
+p_legend <- ggdraw() +
+  draw_label(legend_text, x = 0.05, y = 0.95, hjust = 0, vjust = 1, size = 9, fontfamily = "mono") +
+  theme(plot.background = element_rect(fill = "white", colour = NA))
+
+# Combine
+p_final <- plot_grid(p_main, p_legend, ncol = 2, rel_widths = c(1.5, 1))
+
+ggsave(
+  file.path(output_dir, "volcano_test.png"),
+  plot = p_final, width = 18, height = 8, dpi = 300, bg = "white"
+)
+
+```
+```{r risk-immune-heatmap}
+## Patient-level heatmap: B cell and Exhausted CD8+ T cells vs DFS risk
+heatmap_features <- c("B cell", "Exhausted CD8+ T cells")
+
+heatmap_data <- scores_long %>%
+  filter(cell_type %in% heatmap_features) %>%
+  group_by(patient_id, cell_type, risk_grp, rsf_risk) %>%
+  summarise(enrichment = mean(enrichment, na.rm = TRUE), .groups = "drop")
+
+patient_meta <- heatmap_data %>%
+  distinct(patient_id, risk_grp, rsf_risk) %>%
+  arrange(rsf_risk)
+
+hm_wide <- heatmap_data %>%
+  select(patient_id, cell_type, enrichment) %>%
+  pivot_wider(names_from = patient_id, values_from = enrichment) %>%
+  tibble::column_to_rownames("cell_type") %>%
+  as.matrix()
+
+hm_wide <- hm_wide[, patient_meta$patient_id, drop = FALSE]
+
+hm_log <- log10(hm_wide + 1e-6)
+hm_z   <- t(scale(t(hm_log)))
+
+ann_col <- data.frame(
+  risk_grp = factor(patient_meta$risk_grp, levels = c("Low", "High")),
+  row.names = patient_meta$patient_id
+)
+
+ann_colors <- list(
+  risk_grp = c(Low = "#004B23", High = "#800000")
+)
+
+heatmap_stats <- lapply(heatmap_features, function(ct) {
+  df <- heatmap_data %>% filter(cell_type == ct)
+  sp <- cor.test(df$rsf_risk, df$enrichment, method = "spearman", exact = FALSE)
+  wx <- wilcox.test(enrichment ~ risk_grp, data = df)
+  data.frame(
+    cell_type  = ct,
+    spearman_r = unname(sp$estimate),
+    spearman_p = sp$p.value,
+    wilcox_p   = wx$p.value,
+    stringsAsFactors = FALSE
+  )
+})
+heatmap_stats <- bind_rows(heatmap_stats)
+
+stats_label <- paste(
+  apply(heatmap_stats, 1, function(r) {
+    sprintf(
+      "%s: Spearman r=%.3f (p=%.3g); Wilcoxon p=%.3g",
+      r["cell_type"],
+      as.numeric(r["spearman_r"]),
+      as.numeric(r["spearman_p"]),
+      as.numeric(r["wilcox_p"])
+    )
+  }),
+  collapse = "\n"
+)
+
+print(heatmap_stats)
+
+heatmap_title <- paste0(
+  "Stage 2 xCell2 enrichment by DFS risk (n=",
+  nrow(patient_meta), " patients)\n",
+  stats_label
+)
+
+heatmap_colors <- colorRampPalette(c("#2166AC", "white", "#B2182B"))(100)
+
+n_low <- sum(patient_meta$risk_grp == "Low")
+gaps_col <- if (n_low > 0L && n_low < ncol(hm_z)) n_low else NULL
+
+draw_heatmap <- function() {
+  pheatmap(
+    hm_z,
+    cluster_cols = FALSE,
+    cluster_rows = FALSE,
+    annotation_col = ann_col,
+    annotation_colors = ann_colors,
+    color = heatmap_colors,
+    main = heatmap_title,
+    fontsize_col = 7,
+    fontsize_row = 11,
+    border_color = NA,
+    gaps_col = gaps_col
+  )
+}
+
+out_pdf <- file.path(output_dir, "Stage2_risk_immune_heatmap.pdf")
+out_png <- file.path(output_dir, "Stage2_risk_immune_heatmap.png")
+
+pdf(out_pdf, width = 12, height = 4.5)
+draw_heatmap()
+dev.off()
+
+png(out_png, width = 12, height = 4.5, units = "in", res = 300)
+draw_heatmap()
+dev.off()
+
+cat("Saved:", out_pdf, "\n")
+cat("Saved:", out_png, "\n")
+```
+
+```{r risk-immune-correlation-panel}
+## Optional: 3-variable Spearman correlation matrix (rsf_risk, B cell, Exhausted CD8)
+corr_input <- heatmap_data %>%
+  select(patient_id, cell_type, enrichment, rsf_risk) %>%
+  pivot_wider(names_from = cell_type, values_from = enrichment) %>%
+  select(rsf_risk, all_of(heatmap_features))
+
+corr_mat <- cor(corr_input, method = "spearman", use = "complete.obs")
+print(round(corr_mat, 3))
+
+out_corr_pdf <- file.path(output_dir, "Stage2_risk_immune_spearman_corr.pdf")
+pdf(out_corr_pdf, width = 5, height = 4.5)
+pheatmap(
+  corr_mat,
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  display_numbers = TRUE,
+  number_format = "%.2f",
+  color = heatmap_colors,
+  main = "Spearman correlation: risk vs immune enrichment",
+  border_color = NA
+)
+dev.off()
+cat("Saved:", out_corr_pdf, "\n")
+```
+
+```{r}
+which(stage2_with_ids[, 1] == "patient_id_g")
+# Extract T IDs (column names) and G IDs (row 2)
+t_ids <- colnames(stage2_with_ids)
+g_ids <- as.character(stage2_with_ids[2, ])
+
+# Build mapping dataframe
+id_map <- data.frame(t_id = t_ids, g_id = g_ids, stringsAsFactors = FALSE)
+
+# Extract CD8 scores from scores_long (has T IDs)
+cd8_scores <- scores_long[scores_long$cell_type == "CD8-positive, alpha-beta T cell", 
+                           c("sample", "enrichment")]
+
+# Merge CD8 scores with ID map to get G IDs
+cd8_scores <- merge(cd8_scores, id_map, by.x = "sample", by.y = "t_id")
+
+# Merge with survival_df using G IDs
+cor_df <- merge(cd8_scores,
+                survival_df[, c("patient_id", "abundance_metacluster_leiden_1.0_MC_0")],
+                by.x = "g_id", by.y = "patient_id")
+
+nrow(cor_df)
+head(cor_df)
+```
+```{r}
+colnames(cor_df)[4] <- "MC_0"
+
+# Run correlations
+pearson_corr  <- cor.test(cor_df$enrichment, cor_df$MC_0, method = "pearson")
+spearman_corr <- cor.test(cor_df$enrichment, cor_df$MC_0, method = "spearman")
+
+# Plot
+ggplot(cor_df, aes(x = MC_0, y = enrichment)) +
+  geom_point(size = 2, alpha = 0.8) +
+  geom_smooth(method = "lm", se = FALSE, colour = "blue") +
+  annotate("text",
+           x = min(cor_df$MC_0, na.rm = TRUE),
+           y = max(cor_df$enrichment, na.rm = TRUE),
+           label = paste0("Pearson r = ", signif(pearson_corr$estimate, 3),
+                          "\np = ", signif(pearson_corr$p.value, 3)),
+           hjust = 0, colour = "darkred", size = 3.5) +
+  annotate("text",
+           x = min(cor_df$MC_0, na.rm = TRUE),
+           y = max(cor_df$enrichment, na.rm = TRUE) * 0.85,
+           label = paste0("Spearman r = ", signif(spearman_corr$estimate, 3),
+                          "\np = ", signif(spearman_corr$p.value, 3)),
+           hjust = 0, colour = "darkgreen", size = 3.5) +
+  labs(
+    title = "CD8+ T Cell Enrichment vs MC_0 Abundance",
+    x     = "Abundance Metacluster Leiden 1.0 MC_0",
+    y     = "CD8-positive, alpha-beta T cell Enrichment Score"
+  ) +
+  theme_classic()
+```
+```{r}
+library(ggplot2)
+library(cowplot)
+
+# Fix top3 as proper character vector
+top3 <- c(
+  "naive thymus-derived CD8-positive, alpha-beta T cell",
+  "dendritic cell",
+  "CD8-positive, alpha-beta T cell"
+)
+
+plot_list <- list()
+
+for (i in seq_along(top3)) {
+  ct <- top3[i]
+  
+  ct_scores <- scores_long[scores_long$cell_type %in% ct, c("sample", "enrichment")]
+  ct_scores <- merge(ct_scores, id_map, by.x = "sample", by.y = "t_id")
+  ct_cor_df <- merge(ct_scores,
+                     survival_df[, c("patient_id", "abundance_metacluster_leiden_1.0_MC_0")],
+                     by.x = "g_id", by.y = "patient_id")
+  colnames(ct_cor_df)[4] <- "MC_0"
+  
+  # Skip if not enough data
+  ct_cor_df <- ct_cor_df[is.finite(ct_cor_df$enrichment) & is.finite(ct_cor_df$MC_0), ]
+  if (nrow(ct_cor_df) < 3) {
+    message("Skipping ", ct, ": not enough observations (", nrow(ct_cor_df), ")")
+    next
+  }
+  
+  pearson_corr  <- cor.test(ct_cor_df$enrichment, ct_cor_df$MC_0, method = "pearson")
+  spearman_corr <- cor.test(ct_cor_df$enrichment, ct_cor_df$MC_0, method = "spearman", exact = FALSE)
+  
+  p <- ggplot(ct_cor_df, aes(x = MC_0, y = enrichment)) +
+    geom_point(size = 2, alpha = 0.8) +
+    geom_smooth(method = "lm", se = FALSE, colour = "blue") +
+    annotate("text",
+             x = min(ct_cor_df$MC_0, na.rm = TRUE),
+             y = max(ct_cor_df$enrichment, na.rm = TRUE),
+             label = paste0("Pearson r = ", signif(pearson_corr$estimate, 3),
+                            "\np = ", signif(pearson_corr$p.value, 3)),
+             hjust = 0, colour = "darkred", size = 3) +
+    annotate("text",
+             x = min(ct_cor_df$MC_0, na.rm = TRUE),
+             y = max(ct_cor_df$enrichment, na.rm = TRUE) * 0.85,
+             label = paste0("Spearman r = ", signif(spearman_corr$estimate, 3),
+                            "\np = ", signif(spearman_corr$p.value, 3)),
+             hjust = 0, colour = "darkgreen", size = 3) +
+    labs(title = ct, x = "MC_0 Abundance", y = "Enrichment Score") +
+    theme_classic() +
+    theme(plot.title = element_text(size = 8))
+  
+  plot_list[[i]] <- p
+}
+
+# Remove NULL entries from skipped cell types
+plot_list <- Filter(Negate(is.null), plot_list)
+
+plot_grid(plotlist = plot_list, ncol = length(plot_list))
+```
+
+```{r}
+library(ggplot2)
+library(cowplot)
+
+# Same top3 as before
+top3 <- c(
+  "naive thymus-derived CD8-positive, alpha-beta T cell",
+  "dendritic cell",
+  "CD8-positive, alpha-beta T cell"
+)
+
+plot_list_mc5 <- list()
+
+for (i in seq_along(top3)) {
+  ct <- top3[i]
+  
+  ct_scores <- scores_long[scores_long$cell_type %in% ct, c("sample", "enrichment")]
+  ct_scores <- merge(ct_scores, id_map, by.x = "sample", by.y = "t_id")
+  ct_cor_df <- merge(ct_scores,
+                     survival_df[, c("patient_id", "abundance_metacluster_leiden_1.0_MC_5")],
+                     by.x = "g_id", by.y = "patient_id")
+  colnames(ct_cor_df)[4] <- "MC_5"
+  
+  # Skip if not enough data or non-finite
+  ct_cor_df <- ct_cor_df[is.finite(ct_cor_df$enrichment) & is.finite(ct_cor_df$MC_5), ]
+  if (nrow(ct_cor_df) < 3) {
+    message("Skipping ", ct, " for MC_5: not enough observations (", nrow(ct_cor_df), ")")
+    next
+  }
+  
+  pearson_corr  <- cor.test(ct_cor_df$enrichment, ct_cor_df$MC_5, method = "pearson")
+  spearman_corr <- cor.test(ct_cor_df$enrichment, ct_cor_df$MC_5, method = "spearman", exact = FALSE)
+  
+  p <- ggplot(ct_cor_df, aes(x = MC_5, y = enrichment)) +
+    geom_point(size = 2, alpha = 0.8) +
+    geom_smooth(method = "lm", se = FALSE, colour = "blue") +
+    annotate("text",
+             x = min(ct_cor_df$MC_5, na.rm = TRUE),
+             y = max(ct_cor_df$enrichment, na.rm = TRUE),
+             label = paste0("Pearson r = ", signif(pearson_corr$estimate, 3),
+                            "\np = ", signif(pearson_corr$p.value, 3)),
+             hjust = 0, colour = "darkred", size = 3) +
+    annotate("text",
+             x = min(ct_cor_df$MC_5, na.rm = TRUE),
+             y = max(ct_cor_df$enrichment, na.rm = TRUE) * 0.85,
+             label = paste0("Spearman r = ", signif(spearman_corr$estimate, 3),
+                            "\np = ", signif(spearman_corr$p.value, 3)),
+             hjust = 0, colour = "darkgreen", size = 3) +
+    labs(title = paste0(ct, " vs MC_5"),
+         x = "MC_5 Abundance",
+         y = "Enrichment Score") +
+    theme_classic() +
+    theme(plot.title = element_text(size = 8))
+  
+  plot_list_mc5[[i]] <- p
+}
+
+# Remove NULL entries from skipped cell types
+plot_list_mc5 <- Filter(Negate(is.null), plot_list_mc5)
+
+# Show all MC_5 plots
+plot_grid(plotlist = plot_list_mc5, ncol = length(plot_list_mc5))
+```
+```{r}
+
+
+## 1) Define the cell types of interest
+cell_types <- c(
+  "B cell",
+  "conventional dendritic cell",
+  "Exhausted CD8+ T cells"
+)
+
+plot_list <- list()
+
+for (i in seq_along(cell_types)) {
+  ct <- cell_types[i]
+  
+  # 2) Filter scores_long to this cell type
+  ct_scores <- scores_long[
+    scores_long$cell_type == ct,
+    c("sample", "enrichment")
+  ]
+  
+  # Map sample (tube) IDs to patient IDs via id_map
+  ct_scores <- merge(
+    ct_scores,
+    id_map,
+    by.x = "sample",
+    by.y = "t_id"
+  )
+  
+  # 3) Bring in continuous risk score from survival_df
+  #    Replace 'rsf_risk' with the exact column name of your risk score
+  ct_cor_df <- merge(
+    ct_scores,
+    survival_df[, c("patient_id", "rsf_risk")],
+    by.x = "g_id",
+    by.y = "patient_id"
+  )
+  
+  colnames(ct_cor_df)[which(names(ct_cor_df) == "rsf_risk")] <- "risk_score"
+  
+  # Keep only finite values
+  ct_cor_df <- ct_cor_df[
+    is.finite(ct_cor_df$enrichment) & is.finite(ct_cor_df$risk_score),
+  ]
+  
+  # Skip if too few points
+  if (nrow(ct_cor_df) < 3) {
+    message("Skipping ", ct, ": not enough observations (", nrow(ct_cor_df), ")")
+    next
+  }
+  
+  # 4) Pearson and Spearman correlations (enrichment vs risk_score)
+  pearson_corr  <- cor.test(ct_cor_df$enrichment, ct_cor_df$risk_score, method = "pearson")
+  spearman_corr <- cor.test(ct_cor_df$enrichment, ct_cor_df$risk_score, method = "spearman")
+  
+  # 5) Plot: risk_score vs enrichment for this cell type
+  p <- ggplot(ct_cor_df, aes(x = risk_score, y = enrichment)) +
+    geom_point(size = 3, alpha = 0.8) +
+    geom_smooth(method = "lm", se = FALSE, colour = "blue") +
+    labs(
+      title = ct,
+      x = "Risk score",
+      y = "Enrichment score"
+    ) +
+    annotate(
+      "text",
+      x = min(ct_cor_df$risk_score, na.rm = TRUE),
+      y = max(ct_cor_df$enrichment, na.rm = TRUE),
+      label = paste0(
+        "Pearson r = ", signif(pearson_corr$estimate, 3),
+        "\nP = ", signif(pearson_corr$p.value, 3)
+      ),
+      hjust = 0,
+      colour = "darkred",
+      size = 3
+    ) +
+    annotate(
+      "text",
+      x = min(ct_cor_df$risk_score, na.rm = TRUE),
+      y = max(ct_cor_df$enrichment, na.rm = TRUE) * 0.9,
+      label = paste0(
+        "Spearman r = ", signif(spearman_corr$estimate, 3),
+        "\nP = ", signif(spearman_corr$p.value, 3)
+      ),
+      hjust = 0,
+      colour = "darkgreen",
+      size = 3
+    ) +
+    theme_classic() +
+    theme(plot.title = element_text(size = 9))
+  
+  plot_list[[length(plot_list) + 1]] <- p
+}
+
+## 6) Arrange the plots side by side
+if (length(plot_list) > 0) {
+  plot_grid(plotlist = plot_list, ncol = length(plot_list))
+} else {
+  message("No plots generated: all cell types had insufficient data.")
+}
+
+
+##troubleshooting
+str(scores_long)
+head(scores_long)
+summary(scores_long$enrichment)
+```
+```{r}
+##large outliers making it hard to see
+#trying violin plots instead
+
+
+
+# Check that risk_grp exists and looks right
+table(survival_df$risk_grp)
+
+cell_types <- c(
+  "B cell",
+  "conventional dendritic cell",
+  "Exhausted CD8+ T cells"
+)
+
+plot_list <- list()
+
+for (ct in cell_types) {
+  # 1) Get enrichment for this cell type from scores_long
+  ct_scores <- scores_long %>%
+    filter(cell_type == ct) %>%
+    transmute(sample, enrichment)   # explicitly name columns
+  
+  # 2) Map sample IDs to patient IDs via id_map
+  ct_scores <- ct_scores %>%
+    inner_join(id_map, by = c("sample" = "t_id"))  # adds g_id
+  
+  # 3) Join risk group from survival_df
+  ct_df <- ct_scores %>%
+    inner_join(
+      survival_df %>% 
+        transmute(patient_id, risk_grp),  # explicitly: just these two columns
+      by = c("g_id" = "patient_id")
+    )
+  
+  if (nrow(ct_df) < 3) {
+    message("Skipping ", ct, ": not enough observations (", nrow(ct_df), ")")
+    next
+  }
+  
+  p <- ggplot(ct_df, aes(x = risk_grp, y = enrichment, fill = risk_grp)) +
+    geom_violin(alpha = 0.6, trim = FALSE) +
+    geom_boxplot(width = 0.3, fill = "white", outlier.shape = NA) +
+    geom_jitter(width = 0.15, alpha = 0.5, size = 2) +
+    theme_bw(base_size = 12) +
+    labs(
+      title = ct,
+      x = "Risk group",
+      y = "xCell2 enrichment score"
+    ) +
+    scale_fill_brewer(palette = "Set2") +
+    theme(
+      legend.position = "none",
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 9)
+    )
+  
+  plot_list[[length(plot_list) + 1]] <- p
+}
+
+if (length(plot_list) > 0) {
+  plot_grid(plotlist = plot_list, ncol = length(plot_list))
+} else {
+  message("No plots generated: all cell types had insufficient data.")
+}
+```
+```{r}
+
+```
+

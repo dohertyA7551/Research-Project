@@ -1,0 +1,116 @@
+---
+title: "Stage 2 limma DE by DFS risk group"
+output: html_notebook
+---
+
+Gene-level differential expression (High vs Low DFS risk) for **Stage 2 transcriptomics** using limma.
+
+**Risk groups:** `risk_grp` from `proteomics/survival_df_with_risk.rds` (RSF proteomics model + optimal DFS cutpoint).
+
+**Expression:** `stage2/normalized_genes.csv` (T-tube sample IDs mapped to G `patient_id` via clinical + patient mapping).
+
+**Data policy:** Originals copied to `analysis_working/stage2/`; outputs in `analysis_output/stage2/`.
+
+**R environment:** Knit with `/work_space/envs/transcriptomics2/bin/R` (limma 3.62+ on `/work_space` disk).
+
+```{r setup}
+library(dplyr)
+library(readr)
+library(stringr)
+if (requireNamespace("limma", quietly = TRUE)) library(limma)
+```
+
+```{r load-data}
+if (file.exists("stage2/normalized_genes.csv")) {
+  base_dir       <- "."
+  proteomics_dir <- "../proteomics"
+  spatial_dir    <- "../spatial"
+} else if (file.exists("Transcriptomics/stage2/normalized_genes.csv")) {
+  base_dir       <- "Transcriptomics"
+  proteomics_dir <- "proteomics"
+  spatial_dir    <- "spatial"
+} else {
+  stop("Knit from Transcriptomics/ or its parent directory.")
+}
+
+source(file.path(base_dir, "analysis_helpers.R"))
+dirs <- setup_analysis_dirs(base_dir, "stage2")
+output_dir <- dirs$output_dir
+
+original_files <- c(
+  expression       = file.path(base_dir, "stage2/normalized_genes.csv"),
+  clinical         = file.path(base_dir, "stage2/clinical.csv"),
+  patient mapping  = file.path(spatial_dir, "master_patient_mapping.csv"),
+  survival w/ risk = file.path(proteomics_dir, "survival_df_with_risk.rds")
+)
+missing <- names(original_files)[!file.exists(original_files)]
+if (length(missing) > 0) {
+  stop(
+    "Missing required original file(s):\n",
+    paste0("  - ", missing, ": ", original_files[missing], collapse = "\n")
+  )
+}
+
+working <- ensure_working_copies(original_files, dirs$work_dir)
+survival_df <- readRDS(working["survival w/ risk"])
+clinical <- read_csv(working["clinical"], show_col_types = FALSE)
+mapping <- read_csv(working["patient mapping"], show_col_types = FALSE)
+```
+
+```{r build-matrix-and-meta}
+expr_mat <- prepare_expr_samples_x_genes(
+  read_csv(working["expression"], show_col_types = FALSE),
+  "patient_id"
+)
+expr_mat <- filter_impute_expr(expr_mat)
+cat("Genes x samples:", nrow(expr_mat), "x", ncol(expr_mat), "\n")
+
+sample_ids <- colnames(expr_mat)
+patient_id <- mapping$patient_id_g[
+  match(clinical$r_code[match(sample_ids, clinical$patient_id)], mapping$r_code)
+]
+
+sample_meta <- data.frame(
+  sample_id  = sample_ids,
+  patient_id = patient_id,
+  stringsAsFactors = FALSE
+) %>%
+  left_join(
+    survival_df %>% select(patient_id, risk_grp, rsf_risk),
+    by = "patient_id"
+  )
+
+cat("Samples with Low/High risk:\n")
+print(table(sample_meta$risk_grp, useNA = "always"))
+```
+
+```{r limma-de}
+limma_out <- run_limma_high_vs_low(
+  expr_mat     = expr_mat,
+  sample_meta  = sample_meta,
+  output_dir   = output_dir,
+  file_prefix  = "Stage2"
+)
+
+cat("\nTop 5 up (High > Low):\n")
+print(limma_out$top %>% filter(direction == "up"))
+
+cat("\nTop 5 down (High < Low):\n")
+print(limma_out$top %>% filter(direction == "down"))
+
+sig <- limma_out$results %>% filter(adj.P.Val < 0.05)
+cat("\nGenes FDR < 0.05:", nrow(sig), "\n")
+if (nrow(sig) > 0) print(head(sig %>% select(gene, logFC, P.Value, adj.P.Val), 10))
+```
+
+```{r limma-figures}
+# Fold-change-first volcano + top-|logFC| heatmap (small High-risk group).
+export_limma_figures(
+  results     = limma_out$results,
+  expr_mat    = expr_mat,
+  sample_meta = sample_meta,
+  output_dir  = output_dir,
+  file_prefix = "Stage2",
+  cohort_title = "Stage 2 Transcriptomics"
+)
+```

@@ -1,0 +1,183 @@
+---
+title: "Colossus xCell2 enrichment by DFS risk group"
+output: html_notebook
+---
+
+Volcano differential analysis of xCell2 cell-type enrichment (High vs Low DFS risk) for the **Colossus transcriptomics** cohort.
+
+**Data policy:** Original files are copied to `analysis_working/colossus/` at run time. All reads use those copies; outputs go to `analysis_output/colossus/`. Original datasets are never modified.
+
+Colossus xCell sample IDs (`COL-xxx-R-xxx`) are mapped to **G patient IDs** via `All_patinet_IDS_concatonated_masterdoc.csv` before joining proteomics-derived risk groups.
+
+**Mapping note:** Only `COL-001-R-*` samples currently link to G IDs in the master document. `COL-002-R-*` and `COL-268-R-*` samples are excluded from this risk-group analysis until mapping is extended.
+
+```{r setup}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(readr)
+library(stringr)
+library(EnhancedVolcano)
+```
+
+```{r load-data}
+if (file.exists("collosus_transcriptomics_xcell_results.csv")) {
+  base_dir       <- "."
+  proteomics_dir <- "../proteomics"
+  integrated_dir <- "../Integrated "
+} else if (file.exists("Transcriptomics/collosus_transcriptomics_xcell_results.csv")) {
+  base_dir       <- "Transcriptomics"
+  proteomics_dir <- "proteomics"
+  integrated_dir <- "Integrated "
+} else {
+  stop(
+    "Cannot locate collosus_transcriptomics_xcell_results.csv. ",
+    "Knit from Transcriptomics/ or its parent directory."
+  )
+}
+
+source(file.path(base_dir, "analysis_helpers.R"))
+dirs <- setup_analysis_dirs(base_dir, "colossus")
+
+original_files <- c(
+  xCell2 scores  = file.path(base_dir, "collosus_transcriptomics_xcell_results.csv"),
+  survival w/risk = file.path(proteomics_dir, "survival_df_with_risk.rds"),
+  master IDs     = file.path(integrated_dir, "All_patinet_IDS_concatonated_masterdoc.csv")
+)
+missing <- names(original_files)[!file.exists(original_files)]
+if (length(missing) > 0) {
+  stop(
+    "Missing required original file(s):\n",
+    paste0("  - ", missing, ": ", original_files[missing], collapse = "\n")
+  )
+}
+
+working_files <- ensure_working_copies(original_files, dirs$work_dir)
+xcell_res <- read_csv(working_files[[1]], show_col_types = FALSE)
+survival_df <- readRDS(working_files[[2]])
+master_df <- read_csv(working_files[[3]], show_col_types = FALSE)
+
+sample_ids <- colnames(xcell_res)[-1]
+cat("xCell samples:", length(sample_ids), "\n")
+print(table(sub("-R-.*$", "", sample_ids)))
+```
+
+```{r build-id-map}
+strip_fp <- function(x) str_replace(x, "-FP.*$", "")
+
+master_col_map <- bind_rows(
+  master_df %>%
+    filter(!is.na(patient_id_g), patient_id_g != "") %>%
+    transmute(patient_id = patient_id_g, col_id = strip_fp(COLOSSUS_ID)),
+  master_df %>%
+    filter(!is.na(patient_id_g), patient_id_g != "") %>%
+    transmute(patient_id = patient_id_g, col_id = strip_fp(Old_COLOSSUS_ID)),
+  master_df %>%
+    filter(!is.na(patient_id_g), patient_id_g != "") %>%
+    transmute(patient_id = patient_id_g, col_id = strip_fp(Sample_ID)),
+  master_df %>%
+    filter(!is.na(patient_id_g), patient_id_g != "") %>%
+    transmute(patient_id = patient_id_g, col_id = strip_fp(Alternative_ID))
+) %>%
+  filter(!is.na(col_id), col_id != "", col_id != "NA") %>%
+  distinct(col_id, .keep_all = TRUE)
+
+id_map <- data.frame(sample = sample_ids, stringsAsFactors = FALSE) %>%
+  left_join(master_col_map, by = c("sample" = "col_id"))
+
+cat("Samples mapped to G patient ID:", sum(!is.na(id_map$patient_id)), "\n")
+cat("Samples with proteomics risk:", sum(id_map$patient_id %in% survival_df$patient_id), "\n")
+
+unmapped <- id_map %>% filter(is.na(patient_id))
+if (nrow(unmapped) > 0) {
+  cat("Unmapped prefixes:\n")
+  print(table(sub("-R-.*$", "", unmapped$sample)))
+}
+```
+
+```{r build-scores-long}
+scores_long <- xcell_res %>%
+  rename(cell_type = 1) %>%
+  pivot_longer(-cell_type, names_to = "sample", values_to = "enrichment") %>%
+  left_join(id_map, by = "sample") %>%
+  left_join(
+    survival_df %>% select(patient_id, risk_grp, rsf_risk),
+    by = "patient_id"
+  ) %>%
+  filter(risk_grp %in% c("Low", "High"))
+
+n_samples <- n_distinct(scores_long$sample)
+n_low  <- sum(scores_long$risk_grp == "Low") / n_distinct(scores_long$cell_type)
+n_high <- sum(scores_long$risk_grp == "High") / n_distinct(scores_long$cell_type)
+
+cat("Analysis samples (Low/High risk):", n_samples, "\n")
+cat("Low:", n_low, " High:", n_high, "\n")
+
+differential_results <- scores_long %>%
+  group_by(cell_type) %>%
+  summarise(
+    mean_high = mean(enrichment[risk_grp == "High"], na.rm = TRUE),
+    mean_low  = mean(enrichment[risk_grp == "Low"], na.rm = TRUE),
+    log2FC    = log2((mean_high + 1e-10) / (mean_low + 1e-10)),
+    pval      = wilcox.test(enrichment ~ risk_grp)$p.value,
+    .groups   = "drop"
+  ) %>%
+  mutate(neg_log10_p = -log10(pval))
+
+differential_results_clean <- differential_results[
+  is.finite(differential_results$log2FC) & !is.na(differential_results$pval),
+]
+
+print(differential_results_clean %>%
+        filter(cell_type %in% c("B cell", "Exhausted CD8+ T cells")))
+```
+
+```{r volcano-export}
+volcano_axes <- volcano_axis_limits(differential_results_clean)
+
+p_volcano <- suppressWarnings(
+  EnhancedVolcano(
+    differential_results_clean,
+    lab       = differential_results_clean$cell_type,
+    x         = "log2FC",
+    y         = "pval",
+    pCutoff   = 0.05001,
+    FCcutoff  = 0.5,
+    title     = "Cell Type Enrichment: High vs Low Risk",
+    subtitle  = paste0(
+      "Colossus Transcriptomics | xCell2 scores | n = ",
+      n_samples, " (Low ", n_low, ", High ", n_high, ")"
+    ),
+    xlab      = "Log2 Fold Change (High / Low)",
+    ylab      = "-Log10(p-value)",
+    pointSize = 2.0,
+    labSize   = 3.5,
+    drawConnectors        = TRUE,
+    widthConnectors       = 0.4,
+    maxoverlapsConnectors = Inf,
+    xlim = volcano_axes$xlim,
+    ylim = volcano_axes$ylim
+  ) +
+  theme(
+    plot.margin     = margin(20, 60, 20, 60),
+    legend.position = "bottom"
+  )
+)
+
+print(p_volcano)
+
+out_png <- file.path(dirs$output_dir, "Colossus_risk_enrichment_volcano.png")
+ggsave(out_png, plot = p_volcano, width = 12, height = 8, dpi = 300, bg = "white")
+cat("Saved:", out_png, "\n")
+
+top_fc_table <- export_top_log2fc_table(
+  differential_results,
+  file.path(dirs$output_dir, "Colossus_top5_log2fc_up_down.csv")
+)
+print(top_fc_table)
+
+differential_results_clean[
+  order(abs(differential_results_clean$log2FC), decreasing = TRUE),
+  c("cell_type", "log2FC", "pval")
+]
+```
