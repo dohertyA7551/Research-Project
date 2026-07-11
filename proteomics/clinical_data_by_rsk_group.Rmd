@@ -61,11 +61,20 @@ colours <- c(
 )
 
 
+clin_patient <- clin_risk %>%
+  group_by(patient_id) %>%
+  summarise(
+    age      = first(age[!is.na(age)]),
+    risk_grp = first(risk_grp[!is.na(risk_grp)]),
+    # add other patient-level vars here if needed (stage, sex, etc.)
+    .groups = "drop"
+  )
+clin_patient %>%
+  count(risk_grp)
 # ── Age ───────────────────────────────────────────────────────────────────────
 library(ggpubr) 
-p_age <- ggplot(clin_risk, aes(x = risk_grp, y = age, fill = risk_grp)) +
+p_age <- ggplot(clin_patient, aes(x = risk_grp, y = age, fill = risk_grp)) +
   geom_boxplot(alpha = 0.7, outlier.shape = 21) +
-  geom_jitter(width = 0.15, alpha = 0.3, size = 1) +
   scale_fill_manual(values = colours) +
   stat_compare_means(
     method = "wilcox.test",
@@ -85,6 +94,31 @@ p_age <- ggplot(clin_risk, aes(x = risk_grp, y = age, fill = risk_grp)) +
 
 p_age
 ```
+```{r}
+p_age_violin <- ggplot(clin_patient, aes(x = risk_grp, y = age, fill = risk_grp)) +
+  geom_violin(trim = FALSE, alpha = 0.7, colour = "black") +
+  geom_jitter(aes(colour = risk_grp),
+              width = 0.15, alpha = 0.5, size = 1) +
+  scale_fill_manual(values = colours) +
+  scale_colour_manual(values = colours) +
+  stat_compare_means(
+    method  = "wilcox.test",
+    label   = "p.format",
+    label.x = Inf,
+    label.y = Inf,
+    hjust   = 1.1,
+    vjust   = 1.5,
+    size    = 3.5
+  ) +
+  labs(title = "Age by Risk Group", x = "", y = "Age (years)") +
+  theme_classic(base_size = 12) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold", size = 11)
+  )
+
+p_age_violin
+```
 
 
 ```{r}
@@ -101,7 +135,7 @@ stage_summary <- clin_risk %>%
   group_by(risk_grp) %>%
   mutate(
     pct   = n / sum(n) * 100,
-    label = paste0(n, "\n(", round(pct, 1), "%)")
+   label = paste0(round(pct, 1), "%")
   ) %>%
   ungroup()
 
@@ -190,6 +224,25 @@ for (i in seq_len(nrow(brackets))) {
 }
 
 p_stage
+
+# See the table that ggplot is using
+stage_summary
+
+# Check total N used for percentages
+stage_summary %>% summarise(
+  total_n = sum(n),
+  n_risk_low = sum(n[risk_grp == "Low"]),
+  n_risk_high = sum(n[risk_grp == "High"])
+)
+
+# How many rows total?
+nrow(clin_risk)
+
+# How many non-NA stage rows?
+sum(!is.na(clin_risk$stage))
+
+# Simple cross-tab of risk_grp x stage (raw counts)
+table(clin_risk$risk_grp, clin_risk$stage, useNA = "ifany")
 ```
 
 

@@ -19,12 +19,24 @@ library(tidyr)
 library(tibble)
 library(umap)
 library(limma)
+library(knitr)
 ```
 
 
 ```{r}
 merged_df <-readRDS(file ="RCSI_Taxonomy_clin_prot_merged_df.rds")
-prognostic_groups <- readRDS( file = "profile_group_assignments_fn.rds")
+prognostic_groups <- readRDS("survival_df_with_risk.rds")
+head(prognostic_groups[, c("patient_id","dfs_months", "dfs_event", "rsf_risk", "risk_grp")])
+clin_data <-readRDS( file= "RCSI_Taxonomy_clinical_merged.rds")
+```
+
+```{r}
+
+count_g <-sum(grepl("^G",merged_df$patient_id))
+count_g
+
+count_p <-sum(grepl("^P", merged_df$patient_id))
+count_p
 ```
 
 ```{r}
@@ -53,40 +65,43 @@ cat("RegT:",    length(regT_cols),    "\n"); writeLines(regT_cols)
 
 ###run limma on cell types by prognostic group
 # Create a new df with prognostic groups merged in — original merged_df untouched
+# ── Create analysis_df ────────────────────────────────────────────────────────
 analysis_df <- merge(merged_df, prognostic_groups, by = "patient_id", all.x = TRUE)
 
-# Confirm
-table(analysis_df$profile_group, useNA = "always")
+# ── Filter to non-NA risk_grp BEFORE building anything ───────────────────────
+analysis_df <- analysis_df %>% filter(!is.na(risk_grp))
+cat("nrow(analysis_df) after filter:", nrow(analysis_df), "\n")
 
 all_cell_cols <- c(cancer_cols, stroma_cols, cytT_cols, helperT_cols, regT_cols)
 
-# ── Build expression matrix ──────────────────────────────────────
+# ── Build expression matrix ───────────────────────────────────────────────────
 expr_mat <- t(as.matrix(analysis_df[, all_cell_cols]))
 colnames(expr_mat) <- analysis_df$patient_id
 
-# ── Design matrix ────────────────────────────────────────────────
-profile_group <- factor(analysis_df$profile_group, levels = c("Good", "Poor"))
-design <- model.matrix(~ 0 + profile_group)
-colnames(design) <- make.names(colnames(design))
+# ── Design matrix ─────────────────────────────────────────────────────────────
+risk_grp <- factor(analysis_df$risk_grp, levels = c("Low", "High"))  # local var
+design   <- model.matrix(~ 0 + risk_grp)                              # same name
+colnames(design) <- make.names(colnames(design))  # → risk_grpLow, risk_grpHigh
 
-# ── Contrast ─────────────────────────────────────────────────────
+stopifnot(ncol(expr_mat) == nrow(design))
+
+# ── Contrast ──────────────────────────────────────────────────────────────────
 contrast_mat <- makeContrasts(
-  PoorvsGood = profile_groupPoor - profile_groupGood,
+  HighvsLow = risk_grpHigh - risk_grpLow,
   levels = design
 )
 
-# ── Fit limma ────────────────────────────────────────────────────
+# ── Fit ───────────────────────────────────────────────────────────────────────
 fit  <- lmFit(expr_mat, design)
 fit2 <- contrasts.fit(fit, contrast_mat)
 fit2 <- eBayes(fit2)
 
-# ── Extract results ──────────────────────────────────────────────
+# ── Extract results ───────────────────────────────────────────────────────────
 results_limma <- topTable(fit2,
-                          coef          = "PoorvsGood",
+                          coef          = "HighvsLow",
                           number        = Inf,
                           adjust.method = "BH",
                           sort.by       = "P")
-
 # ── Annotate by cell type ────────────────────────────────────────
 results_limma$cell_type <- dplyr::case_when(
   rownames(results_limma) %in% cancer_cols  ~ "NonImmuneEpithelium",
@@ -103,33 +118,260 @@ saveRDS(results_limma,   "limma_differential_abundance_PoorvsGood_fn.rds")
 
 # ── Quick look ───────────────────────────────────────────────────
 head(results_limma, 20)
+
+cat("ncol(expr_mat):", ncol(expr_mat), "\n")
+cat("nrow(design):  ", nrow(design),   "\n")
+cat("nrow(analysis_df):", nrow(analysis_df), "\n")
 ```
 ```{r}
+# ── Define cell_types from annotated results ──────────────────────────────────
+results_limma$feature <- rownames(results_limma)  # ensure feature col exists
+
+cell_types <- unique(results_limma$cell_type)
+cat("Cell types found:", cell_types, "\n")
+
+
+
 options(scipen = 999)
-# ── 5 tables: UP IN POOR ─────────────────────────────────────────
+
+# ── UP IN HIGH ────────────────────────────────────────────────────────────────
 for (ct in cell_types) {
   tbl <- results_limma %>%
-    filter(cell_type == ct, logFC > 0.15) %>%
+    filter(cell_type == ct, logFC > 0.1) %>%
     arrange(desc(logFC)) %>%
-    select(feature, logFC, AveExpr, t, P.Value, adj.P.Val)
-  
-  cat("\n====== UP IN POOR |", ct, "| n =", nrow(tbl), "======\n")
-  print(tbl, n = Inf)
+    select(feature, logFC, AveExpr, t, P.Value, adj.P.Val) %>%
+    mutate(across(where(is.numeric), ~ round(., 4)))
+
+  if (nrow(tbl) == 0) next
+
+  cat("\n% ====== UP IN HIGH |", ct, "======\n")
+  cat(kable(tbl,
+            format   = "latex",
+            booktabs = TRUE,
+            caption  = paste("Up in High Risk –", ct),
+            col.names = c("Feature", "logFC", "AveExpr", "t", "P-value", "Adj. P-value")),
+      "\n")
 }
 
-# ── 5 tables: UP IN GOOD ─────────────────────────────────────────
+# ── REDUCED IN HIGH RISK ──────────────────────────────────────────────────────
 for (ct in cell_types) {
   tbl <- results_limma %>%
-    filter(cell_type == ct, logFC < -0.15) %>%
+    filter(cell_type == ct, logFC < -0.1) %>%
     arrange(logFC) %>%
-    select(feature, logFC, AveExpr, t, P.Value, adj.P.Val)
-  
-  cat("\n====== UP IN GOOD |", ct, "| n =", nrow(tbl), "======\n")
-print(tbl, n = Inf)
+    select(feature, logFC, AveExpr, t, P.Value, adj.P.Val) %>%
+    mutate(across(where(is.numeric), ~ round(., 4)))
+
+  if (nrow(tbl) == 0) next
+
+  cat("\n% ====== REDUCED IN HIGH RISK |", ct, "======\n")
+  cat(kable(tbl,
+            format    = "latex",
+            booktabs  = TRUE,
+            caption   = paste("Features with reduced expression in High Risk group --", ct,
+                              "(logFC $< -0.1$)"),
+            col.names = c("Feature", "logFC", "AveExpr", "t", "P-value", "Adj. P-value")),
+      "\n")
+
 }
+
+
+
 ```
 ```{r}
-#####differential abundance at prognoisis level not split by cell type
+# ── Check group counts ────────────────────────────────────────────────────────
+table(analysis_df$risk_grp)
 
+# ── Check factor levels (Low should be reference = first) ─────────────────────
+levels(risk_grp)
+
+# ── Check design matrix maps correctly ────────────────────────────────────────
+head(data.frame(
+  patient    = analysis_df$patient_id,
+  risk_grp   = analysis_df$risk_grp,
+  design_Low  = design[, "risk_grpLow"],
+  design_High = design[, "risk_grpHigh"]
+), 10)
+
+# ── Check contrast direction ──────────────────────────────────────────────────
+# HighvsLow = High - Low
+# So logFC > 0 means HIGHER in High
+# So logFC < 0 means LOWER in High = higher in Low
+cat("Contrast is: High - Low\n")
+cat("logFC > 0 = enriched in HIGH\n")
+cat("logFC < 0 = enriched in LOW\n")
+
+# ── Sanity check with a known marker ─────────────────────────────────────────
+# e.g. FOXP3 should be higher in regulatory T cells
+results_limma %>%
+  filter(grepl("FOXP3", feature)) %>%
+  select(feature, cell_type, logFC, P.Value, adj.P.Val)
+```
+```{r}
+results_limma <- results_limma %>%
+  dplyr::mutate(
+    cell_type = dplyr::recode(
+      cell_type,
+      "NonImmuneEpithelium" = "Cancer Cells"
+    )
+  )
+
+
+colours <- c(
+  "Low"  = "#004B23",   # enriched in Low / reduced in High
+  "High" = "#800000",   # enriched in High
+  "ns"   = "grey70"     # not significant
+)
+
+# ── Prepare data ──────────────────────────────────────────────────────────────
+volcano_df <- results_limma %>%
+  mutate(
+    marker      = gsub("baseline_Mean\\.Cell\\.(.+)_mean_.+", "\\1", feature),
+    neg_log10_p = -log10(P.Value),
+    direction   = dplyr::case_when(
+      P.Value < 0.05 & logFC >  0.1 ~ "High",
+      P.Value < 0.05 & logFC < -0.1 ~ "Low",
+      TRUE                          ~ "ns"
+    ),
+    label = ifelse(direction != "ns", marker, NA)
+  ) %>%
+  mutate(direction = factor(direction, levels = c("Low", "High", "ns")))
+
+colours <- c(
+  "Low"  = "#004B23",
+  "High" = "#800000",
+  "ns"   = "grey70"
+)
+for (ct in cell_types) {
+
+  p <- ggplot(
+    volcano_df %>% filter(cell_type == ct),
+    aes(x = logFC, y = neg_log10_p,
+        colour = direction, label = label)
+  ) +
+    geom_point(aes(size = ifelse(direction == "ns", 0.8, 1.2)),
+               alpha = 0.8) +
+    geom_text_repel(
+      na.rm         = TRUE,
+      size          = 2.8,
+      max.overlaps  = 20,
+      segment.size  = 0.3,
+      segment.color = "grey50",
+      fontface      = "bold"
+    ) +
+    geom_vline(xintercept = c(-0.1, 0.1),
+               linetype = "dashed", colour = "grey40", linewidth = 0.4) +
+    geom_hline(yintercept = -log10(0.05),
+               linetype = "dashed", colour = "grey40", linewidth = 0.4) +
+    scale_colour_manual(
+      values = colours,
+      labels = c(
+        "High" = "Enriched in High Risk",
+        "Low"  = "Reduced in High Risk",
+        "ns"   = "Not significant"
+      )
+    ) +
+    scale_size_identity() +
+    labs(
+      title   = paste("Differential Protein Abundance: High vs Low Risk Groups –", ct),
+      x       = "log Fold Change (High – Low)",
+      y       = expression(-log[10](P~value)),
+      colour  = NULL
+    ) +
+    theme_classic(base_size = 11) +
+    theme(
+      plot.title      = element_text(face = "bold", size = 12),
+      legend.position = "bottom",
+      strip.text      = element_text(face = "bold"),
+      strip.background = element_rect(fill = "grey95", colour = NA)
+    )
+
+  print(p)
+}
+table(volcano_df$direction, useNA = "ifany")
+unique(volcano_df$direction)
+# 1. How many rows overall?
+nrow(volcano_df)
+
+# 2. How many rows for each cell type?
+table(volcano_df$cell_type)
+
+# 3. What is left after filtering for the cell type and non-missing direction?
+ct <- "Cancer Cells"   # or whatever is in cell_types causing trouble
+volcano_df %>%
+  dplyr::filter(cell_type == ct) %>%
+  dplyr::summarise(
+    n_all   = dplyr::n(),
+    n_fdr   = sum(!is.na(direction)),
+    n_high  = sum(direction == "High"),
+    n_low   = sum(direction == "Low"),
+    n_ns    = sum(direction == "ns")
+  )
+print(ct)
+
+volcano_df %>%
+  dplyr::filter(cell_type == ct) %>%
+  dplyr::summarise(
+    min_logFC = min(logFC, na.rm = TRUE),
+    max_logFC = max(logFC, na.rm = TRUE)
+  )
+p_test <- ggplot(
+  volcano_df %>% dplyr::filter(cell_type == ct),
+  aes(x = logFC, y = neg_log10_p)
+) +
+  geom_point(colour = "black", size = 2)
+
+print(p_test)
+```
+
+
+```{r}
+ct <- "Cancer Cells"   # or whatever exact value is in volcano_df$cell_type
+
+p <- ggplot(
+  volcano_df %>% dplyr::filter(cell_type == ct),
+  aes(x = logFC, y = neg_log10_p, colour = direction)
+) +
+  # points
+  geom_point(aes(size = ifelse(direction == "ns", 0.8, 1.2)),
+             alpha = 0.8) +
+  # labels only for non‑ns (because label is NA otherwise)
+  ggrepel::geom_text_repel(
+    aes(label = label),
+    na.rm         = TRUE,
+    size          = 2.8,
+    max.overlaps  = 20,
+    segment.size  = 0.3,
+    segment.color = "grey50",
+    fontface      = "bold"
+  ) +
+  geom_vline(xintercept = c(-0.1, 0.1),
+             linetype = "dashed", colour = "grey40", linewidth = 0.4) +
+  geom_hline(yintercept = -log10(0.05),
+             linetype = "dashed", colour = "grey40", linewidth = 0.4) +
+  scale_colour_manual(
+    values = c(
+      "Low"  = "#004B23",
+      "High" = "#800000",
+      "ns"   = "grey70"
+    ),
+    labels = c(
+      "High" = "Enriched in High Risk",
+      "Low"  = "Reduced in High Risk",
+      "ns"   = "Not significant"
+    )
+  ) +
+  scale_size_identity() +
+  labs(
+    title  = paste("Differential Protein Abundance: High vs Low Risk Groups –", ct),
+    x      = "log Fold Change (High – Low)",
+    y      = expression(-log[10](P~value)),
+    colour = NULL
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    plot.title = element_text(face = "bold", size = 12),
+    legend.position = "bottom"
+)
+print(p)
 ```
 

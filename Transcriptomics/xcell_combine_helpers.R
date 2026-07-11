@@ -192,7 +192,7 @@ load_xcell_scores_long <- function(
         levels = intersect(all_cohorts, cohorts)
       )
     )
-  if (harmonize_cell_types && "Taxonomy" %in% cohorts) {
+  if (harmonize_cell_types) {
     out <- harmonize_xcell_cell_types(out, p)
   }
   out
@@ -253,34 +253,11 @@ ad_test_k_samples <- function(values_by_cohort) {
   )
 }
 
-cohort_enrichment_vectors <- function(
+run_xcell_ad_by_cell_type <- function(
   scores_long,
   cohorts = c("Stage2", "Retrospective", "Colossus", "Taxonomy"),
-  risk_grp = NULL,
-  z_score_by_cell_type = FALSE
-) {
-  sub <- scores_long %>% dplyr::filter(.data$cohort %in% cohorts)
-  if (!is.null(risk_grp)) {
-    sub <- sub %>% dplyr::filter(.data$risk_grp == risk_grp)
-  }
-  if (z_score_by_cell_type) {
-    sub <- sub %>%
-      dplyr::group_by(.data$cell_type) %>%
-      dplyr::mutate(
-        enrichment = as.numeric(scale(.data$enrichment))
-      ) %>%
-      dplyr::ungroup()
-  }
-  stats::setNames(
-    lapply(cohorts, function(cn) sub$enrichment[sub$cohort == cn]),
-    cohorts
-  )
-}
-
-run_xcell_ad_dataset_level <- function(
-  scores_long,
-  cohorts = c("Stage2", "Retrospective", "Colossus", "Taxonomy"),
-  ad_alpha = 0.05
+  ad_alpha = 0.05,
+  require_all_cohorts = TRUE
 ) {
   cohorts <- intersect(cohorts, unique(as.character(scores_long$cohort)))
   n_per_cohort <- scores_long %>%
@@ -288,93 +265,90 @@ run_xcell_ad_dataset_level <- function(
     dplyr::distinct(.data$cohort, .data$sample) %>%
     dplyr::count(.data$cohort, name = "n_samples")
 
-  run_one <- function(label, vectors) {
-    ns <- vapply(vectors, length, integer(1))
-    test <- ad_test_k_samples(vectors)
-    data.frame(
-      test = label,
-      ad_stat = test$ad,
-      t_ad = test$t_ad,
-      ad_p = test$p,
-      pass = is.finite(test$p) && test$p >= ad_alpha,
-      n_values = paste(ns, collapse = ","),
-      stringsAsFactors = FALSE
-    )
+  cell_types <- if (require_all_cohorts) {
+    xcell_cell_types_in_all_cohorts(scores_long, cohorts)
+  } else {
+    sort(unique(scores_long$cell_type))
   }
 
-  tests <- dplyr::bind_rows(
-    run_one(
-      "raw_all_samples",
-      cohort_enrichment_vectors(scores_long, cohorts)
-    ),
-    run_one(
-      "raw_low_risk",
-      cohort_enrichment_vectors(scores_long, cohorts, risk_grp = "Low")
-    ),
-    run_one(
-      "raw_high_risk",
-      cohort_enrichment_vectors(scores_long, cohorts, risk_grp = "High")
-    ),
-    run_one(
-      "zscore_by_cell_type_all_samples",
-      cohort_enrichment_vectors(scores_long, cohorts, z_score_by_cell_type = TRUE)
-    ),
-    run_one(
-      "zscore_by_cell_type_low_risk",
-      cohort_enrichment_vectors(
-        scores_long, cohorts, risk_grp = "Low", z_score_by_cell_type = TRUE
-      )
-    ),
-    run_one(
-      "zscore_by_cell_type_high_risk",
-      cohort_enrichment_vectors(
-        scores_long, cohorts, risk_grp = "High", z_score_by_cell_type = TRUE
-      )
+  rows <- lapply(cell_types, function(ct) {
+    sub <- scores_long %>% dplyr::filter(.data$cell_type == ct)
+    vecs <- stats::setNames(
+      lapply(cohorts, function(cn) sub$enrichment[sub$cohort == cn]),
+      cohorts
     )
-  )
+    vecs <- vecs[vapply(vecs, function(v) sum(is.finite(v)) > 0, logical(1))]
+    tst <- ad_test_k_samples(vecs)
+    ns <- vapply(
+      cohorts,
+      function(cn) sum(sub$cohort == cn & is.finite(sub$enrichment)),
+      integer(1)
+    )
+    out <- data.frame(
+      cell_type = ct,
+      ad_stat = tst$ad,
+      t_ad = tst$t_ad,
+      ad_p = tst$p,
+      n_cohorts = tst$k,
+      pass_merge = is.finite(tst$p) && tst$p >= ad_alpha,
+      stringsAsFactors = FALSE
+    )
+    for (cn in cohorts) {
+      out[[paste0("n_", cn)]] <- ns[cn]
+    }
+    out
+  })
 
+  results <- dplyr::bind_rows(rows)
   list(
-    tests = tests,
+    results = results,
     n_samples = n_per_cohort,
-    n_cell_types = dplyr::n_distinct(scores_long$cell_type),
+    n_cell_types = nrow(results),
+    n_pass = sum(results$pass_merge, na.rm = TRUE),
+    passing_cell_types = results$cell_type[results$pass_merge],
     cohorts = cohorts
   )
 }
 
-export_xcell_ad_dataset_plot <- function(ad_out, output_dir, ad_alpha = 0.05) {
+export_xcell_ad_cell_type_plot <- function(ad_out, output_dir, ad_alpha = 0.05) {
   if (!requireNamespace("ggplot2", quietly = TRUE)) return(invisible(NULL))
-  plot_df <- ad_out$tests %>%
+  plot_df <- ad_out$results %>%
+    dplyr::filter(is.finite(.data$ad_p)) %>%
     dplyr::mutate(
-      test_label = gsub("_", " ", .data$test),
       neg_log10_p = -log10(pmax(.data$ad_p, .Machine$double.xmin)),
-      pass = ifelse(.data$pass, "Pass", "Fail")
+      pass = ifelse(.data$pass_merge, "Pass", "Fail")
     )
+  if (nrow(plot_df) == 0) return(invisible(NULL))
   p <- ggplot2::ggplot(
     plot_df,
-    ggplot2::aes(x = reorder(test_label, ad_p), y = neg_log10_p, fill = pass)
+    ggplot2::aes(
+      x = .data$neg_log10_p,
+      y = reorder(.data$cell_type, .data$ad_p),
+      fill = .data$pass
+    )
   ) +
-    ggplot2::geom_col(width = 0.7) +
-    ggplot2::geom_hline(
-      yintercept = -log10(ad_alpha),
+    ggplot2::geom_col() +
+    ggplot2::geom_vline(
+      xintercept = -log10(ad_alpha),
       linetype = "dashed",
       colour = "grey40"
     ) +
-    ggplot2::coord_flip() +
     ggplot2::scale_fill_manual(values = c(Pass = "#4daf4a", Fail = "#e41a1c")) +
     ggplot2::labs(
-      title = "Dataset-level Anderson-Darling k-sample tests",
+      title = "Anderson-Darling k-sample: xCell2 scores by cell type",
       subtitle = paste0(
-        "Do xCell score distributions match across 4 cohorts? Pass if AD p \u2265 ",
-        ad_alpha, " (dashed line = ", ad_alpha, ")"
+        "Per cell type: do score distributions match across cohorts? ",
+        "Pass if AD p \u2265 ", ad_alpha
       ),
-      x = NULL,
-      y = expression(-log[10] * "(AD p-value)"),
+      x = expression(-log[10] * "(AD p-value)"),
+      y = NULL,
       fill = NULL
     ) +
-    ggplot2::theme_bw(base_size = 11) +
+    ggplot2::theme_bw(base_size = 10) +
     ggplot2::theme(plot.title = ggplot2::element_text(face = "bold"))
-  out <- file.path(output_dir, "xcell_ad_k_sample_dataset_summary.png")
-  ggplot2::ggsave(out, p, width = 9, height = 5.5, dpi = 150)
+  h <- max(5, min(18, 0.22 * nrow(plot_df) + 2))
+  out <- file.path(output_dir, "xcell_ad_by_cell_type_summary.png")
+  ggplot2::ggsave(out, p, width = 8, height = h, dpi = 150, bg = "white")
   message("Wrote ", out)
   invisible(out)
 }
@@ -752,7 +726,7 @@ export_xcell_volcano <- function(
 }
 
 export_xcell_ad_summary_plot <- function(ad_out, output_dir, ad_alpha = 0.05) {
-  export_xcell_ad_dataset_plot(ad_out, output_dir, ad_alpha)
+  export_xcell_ad_cell_type_plot(ad_out, output_dir, ad_alpha)
 }
 
 xcell_cohort_colors <- function() {
@@ -969,7 +943,7 @@ export_xcell_cohort_density_plots <- function(
 run_xcell_ad_and_combined <- function(
   output_dir = NULL,
   ad_alpha = 0.05,
-  combine_test = "zscore_by_cell_type_all_samples"
+  require_all_cohorts = TRUE
 ) {
   if (!requireNamespace("readr", quietly = TRUE)) library(readr)
   p <- resolve_transcriptomics_paths()
@@ -979,37 +953,46 @@ run_xcell_ad_and_combined <- function(
   dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
 
   scores_long <- load_all_xcell_scores_long()
-  ad_out <- run_xcell_ad_dataset_level(scores_long, ad_alpha = ad_alpha)
-  ad_path <- file.path(output_dir, "xcell_ad_k_sample_dataset.csv")
-  readr::write_csv(ad_out$tests, ad_path)
+  ad_out <- run_xcell_ad_by_cell_type(
+    scores_long,
+    ad_alpha = ad_alpha,
+    require_all_cohorts = require_all_cohorts
+  )
+  ad_path <- file.path(output_dir, "xcell_ad_by_cell_type.csv")
+  readr::write_csv(ad_out$results, ad_path)
   message("Wrote ", ad_path)
   readr::write_csv(
     ad_out$n_samples,
     file.path(output_dir, "xcell_ad_cohort_sample_counts.csv")
   )
-
-  gate <- ad_out$tests[ad_out$tests$test == combine_test, , drop = FALSE]
-  if (nrow(gate) == 0) {
-    stop("Unknown combine_test: ", combine_test)
+  if (length(ad_out$passing_cell_types) > 0L) {
+    readr::write_csv(
+      data.frame(cell_type = ad_out$passing_cell_types, stringsAsFactors = FALSE),
+      file.path(output_dir, "xcell_ad_passing_cell_types.csv")
+    )
   }
-  can_combine <- isTRUE(gate$pass[1])
+
+  can_combine <- ad_out$n_pass > 0L
 
   summary_lines <- c(
     paste0("Cohorts: ", paste(ad_out$cohorts, collapse = ", ")),
-    paste0("Cell types: ", ad_out$n_cell_types),
+    paste0("Cell types tested (present in all cohorts): ", ad_out$n_cell_types),
+    paste0("Pass AD (p >= ", ad_alpha, "): ", ad_out$n_pass),
     paste0("Samples per cohort: ", paste(
       ad_out$n_samples$cohort, ad_out$n_samples$n_samples, sep = "=", collapse = "; "
     )),
     "",
-    "Dataset-level Anderson-Darling k-sample tests (k = 4 cohorts):",
-    paste0(
-      "  ", ad_out$tests$test, ": AD p = ",
-      signif(ad_out$tests$ad_p, 4),
-      ifelse(ad_out$tests$pass, " (PASS)", " (FAIL)"),
-      collapse = "\n"
-    ),
+    "Anderson-Darling k-sample tests (k = number of cohorts):",
+    "  One test per cell type — compares score distributions across datasets.",
+    "  Not stratified by High/Low risk.",
     "",
-    paste0("Pooling gate (", combine_test, "): ", can_combine),
+    paste0("Cell types OK to merge: ", length(ad_out$passing_cell_types)),
+    if (length(ad_out$passing_cell_types) > 0L) {
+      paste0("  ", paste(ad_out$passing_cell_types, collapse = ", "))
+    } else {
+      "  (none)"
+    },
+    "",
     paste0("Alpha: ", ad_alpha)
   )
   writeLines(summary_lines, file.path(output_dir, "xcell_ad_summary.txt"))
@@ -1019,7 +1002,7 @@ run_xcell_ad_and_combined <- function(
   result <- list(
     scores_long = scores_long,
     ad_out = ad_out,
-    combine_test = combine_test,
+    passing_cell_types = ad_out$passing_cell_types,
     can_combine = can_combine
   )
 
@@ -1049,17 +1032,23 @@ run_xcell_ad_and_combined <- function(
   }
 
   if (can_combine) {
-    pooled <- prepare_pooled_xcell_scores(scores_long)
+    pooled <- build_xcell_combined_scores(
+      scores_long,
+      cell_types = ad_out$passing_cell_types
+    )
     result$diff_combined <- run_combined_volcano(
-      pooled, "all cohorts pooled", "Combined"
+      pooled,
+      paste0(
+        "AD-passing cell types pooled (n=",
+        length(ad_out$passing_cell_types), ")"
+      ),
+      "Combined"
     )
     return(result)
   }
 
   message(
-    "Combined volcano skipped: ", combine_test,
-    " AD p = ", signif(gate$ad_p[1], 4),
-    " (need p >= ", ad_alpha, " to pool cohorts)."
+    "Combined volcano skipped: no cell types passed AD (p >= ", ad_alpha, ")."
   )
   result
 }

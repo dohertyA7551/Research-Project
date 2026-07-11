@@ -49,6 +49,79 @@ mc_event_both <-readRDS(file ="mc_event_both.rds") #both means taxonomy and rcsi
 mc_no_event_both <-readRDS(file ="mc_noevent_both.rds")
 ```
 
+```{r}
+####post analysis extraction 11/07/26
+
+rsf_fit_v2 <- readRDS("rsf_fit_v2.rds")
+
+vimp2 <- sort(rsf_fit_v2$importance, decreasing = TRUE)
+top15 <- data.frame(
+  metacluster = names(vimp2)[1:15],
+  vimp = vimp2[1:15]
+)
+top15$metacluster <- sub("^abundance_metacluster_leiden_1\\.0_", "", top15$metacluster)
+
+print(top15)
+write.csv(top15, "top15_vimp_stage2.csv", row.names = FALSE)
+```
+
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(stringr)
+
+NAVY <- "#2C4A5E"  # gentle dark blue
+
+# --- Pull top 10 VIMP directly from your Stage 2 RSF fit ---
+rsf_fit_v2 <- readRDS("rsf_fit_v2.rds")
+vimp2 <- sort(rsf_fit_v2$importance, decreasing = TRUE)
+
+vimp_df <- data.frame(
+  metacluster = names(vimp2),
+  vimp = as.numeric(vimp2)
+) %>%
+  mutate(metacluster = str_remove(metacluster, "^abundance_metacluster_leiden_1\\.0_")) %>%
+  slice_max(vimp, n = 10) %>%
+  arrange(desc(vimp)) %>%
+  mutate(metacluster = factor(metacluster, levels = rev(metacluster)))
+
+p <- ggplot(vimp_df, aes(x = vimp, y = metacluster)) +
+  geom_col(fill = NAVY, color = "black", linewidth = 0.4, width = 0.65) +
+  geom_text(
+    aes(label = sprintf("%.3f", vimp)),
+    hjust = -0.15, size = 3.3, color = "black"
+  ) +
+  scale_x_continuous(
+    expand = expansion(mult = c(0, 0.18)),
+    limits = c(0, max(vimp_df$vimp) * 1.18)
+  ) +
+  labs(
+    title = "RSF Variable Importance: Top 10 MetaClusters",
+    x = "VIMP",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    axis.line.x = element_line(color = "black", linewidth = 0.5),
+    axis.line.y = element_line(color = "black", linewidth = 0.5),
+    axis.ticks = element_line(color = "black"),
+    axis.text = element_text(color = "black"),
+    axis.title.x = element_text(face = "bold", color = "black"),
+    plot.title = element_text(face = "bold", color = NAVY, size = 13, hjust = 0),
+    plot.background = element_rect(fill = "white", color = NA),
+    panel.background = element_rect(fill = "white", color = NA)
+  )
+
+p
+
+ggsave(
+  "rsf_vimp_stage2_top10.png",
+  plot = p, width = 8, height = 6, dpi = 300, bg = "white"
+)
+```
+
 
 ```{r}
 #Attempting to assess how much dataset origin confounds my results

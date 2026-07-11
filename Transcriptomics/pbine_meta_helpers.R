@@ -23,6 +23,36 @@ sanitize_pvals_for_pbine <- function(pm, floor = 1e-6, ceiling = 1 - 1e-6) {
   pm
 }
 
+fisher_combine_pval_matrix <- function(pm) {
+  pm <- as.matrix(pm)
+  apply(pm, 1, function(row) {
+    row <- row[is.finite(row)]
+    if (length(row) < 2L) {
+      return(NA_real_)
+    }
+    stats::pchisq(-2 * sum(log(row)), df = 2 * length(row), lower.tail = FALSE)
+  })
+}
+
+combine_pval_matrix <- function(
+  pm,
+  method = "Int",
+  p_floor = 1e-6,
+  rowwise_fallback = TRUE,
+  rowwise_max_rows = 500L
+) {
+  if (method == "Fisher") {
+    return(fisher_combine_pval_matrix(sanitize_pvals_for_pbine(pm, floor = p_floor)))
+  }
+  pbine_combine_pval_matrix(
+    pm,
+    method = method,
+    p_floor = p_floor,
+    rowwise_fallback = rowwise_fallback,
+    rowwise_max_rows = rowwise_max_rows
+  )
+}
+
 estimate_pbine_sigma <- function(pm, shrink = 0.25) {
   pm <- as.matrix(pm)
   sigma <- stats::cor(pm, use = "pairwise.complete.obs")
@@ -130,7 +160,7 @@ pbine_hierarchical_pvals <- function(
   stage1 <- lapply(platform_groups, function(cols) {
     sub <- pm[, cols[cols %in% cn], drop = FALSE]
     if (ncol(sub) == 2L) {
-      pbine_combine_pval_matrix(sub, method = method, p_floor = p_floor, rowwise_fallback = FALSE)
+      combine_pval_matrix(sub, method = method, p_floor = p_floor, rowwise_fallback = FALSE)
     } else {
       pbine_hierarchical_pvals(sub, method = method, p_floor = p_floor, platform_groups = list(all = colnames(sub)))
     }
@@ -140,7 +170,7 @@ pbine_hierarchical_pvals <- function(
   if (ncol(stage_mat) == 1L) {
     return(stage_mat[, 1L])
   }
-  pbine_combine_pval_matrix(
+  combine_pval_matrix(
     stage_mat,
     method = method,
     p_floor = p_floor,
@@ -473,6 +503,356 @@ export_fgsea_meta_heatmap_pbine <- function(
     paste0(file_prefix, "_meta_", collection, "_pbine_heatmap.png")
   )
   ggplot2::ggsave(png_path, p, width = width, height = height, dpi = 150)
+  message("Wrote ", png_path)
+  invisible(png_path)
+}
+
+run_xcell_risk_meta_pbine <- function(
+  diff_list,
+  output_dir,
+  file_prefix = "xcell_high_vs_low",
+  p_cutoff = 0.05,
+  method = "Int",
+  min_cohorts = 2L,
+  export_plots = TRUE
+) {
+  if (!requireNamespace("readr", quietly = TRUE)) {
+    library(readr)
+  }
+  if (!requireNamespace("dplyr", quietly = TRUE)) {
+    library(dplyr)
+  }
+
+  diff_list <- diff_list[!vapply(diff_list, is.null, logical(1))]
+  cohort_names <- names(diff_list)
+  if (length(cohort_names) < 2L) {
+    stop("Pbine xCell meta requires at least two cohort Wilcoxon results.")
+  }
+
+  all_cell_types <- unique(unlist(lapply(diff_list, function(df) df$cell_type)))
+  pval_mat <- vapply(
+    diff_list,
+    function(df) df$pval[match(all_cell_types, df$cell_type)],
+    numeric(length(all_cell_types))
+  )
+  logfc_mat <- vapply(
+    diff_list,
+    function(df) df$log2FC[match(all_cell_types, df$cell_type)],
+    numeric(length(all_cell_types))
+  )
+  if (is.vector(pval_mat)) {
+    pval_mat <- matrix(pval_mat, ncol = 1)
+    logfc_mat <- matrix(logfc_mat, ncol = 1)
+  }
+  colnames(pval_mat) <- cohort_names
+  colnames(logfc_mat) <- cohort_names
+  rownames(pval_mat) <- all_cell_types
+
+  n_cohorts <- apply(pval_mat, 1, function(row) sum(is.finite(row)))
+  keep <- n_cohorts >= min_cohorts
+  if (!any(keep)) {
+    stop("No cell types with p-values in >= ", min_cohorts, " cohorts.")
+  }
+
+  pm <- pval_mat[keep, , drop = FALSE]
+  meta_p <- tryCatch(
+    pbine_hierarchical_pvals(pm, method = method),
+    error = function(e) {
+      if (method != "Fisher") {
+        message(
+          "Pbine method=", method, " failed (", conditionMessage(e),
+          "); retrying with Fisher."
+        )
+        return(pbine_hierarchical_pvals(pm, method = "Fisher"))
+      }
+      stop(e)
+    }
+  )
+
+  mean_log2FC <- rowMeans(logfc_mat[keep, , drop = FALSE], na.rm = TRUE)
+  sign_consistent <- apply(logfc_mat[keep, , drop = FALSE], 1, function(row) {
+    row <- row[is.finite(row)]
+    if (length(row) < 2L) {
+      return(NA)
+    }
+    sum(row > 0) == length(row) || sum(row < 0) == length(row)
+  })
+
+  meta <- data.frame(
+    cell_type = rownames(pm),
+    meta_p = meta_p,
+    n_cohorts = n_cohorts[keep],
+    mean_log2FC = mean_log2FC,
+    sign_consistent = sign_consistent,
+    stringsAsFactors = FALSE
+  )
+  for (cn in cohort_names) {
+    meta[[paste0("pval_", cn)]] <- pval_mat[keep, cn]
+    meta[[paste0("log2FC_", cn)]] <- logfc_mat[keep, cn]
+  }
+  meta <- meta[order(meta$meta_p), ]
+
+  dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+  out_path <- file.path(output_dir, paste0(file_prefix, "_meta_pbine.csv"))
+  readr::write_csv(meta, out_path)
+  message("Wrote Pbine meta: ", out_path)
+
+  sig <- meta %>% dplyr::filter(.data$meta_p < p_cutoff)
+  message("Meta cell types p < ", p_cutoff, ": ", nrow(sig))
+
+  if (export_plots) {
+    export_xcell_risk_meta_dotplot(meta, output_dir, file_prefix, p_cutoff)
+    export_xcell_risk_meta_volcano(meta, output_dir, file_prefix, p_cutoff)
+  }
+
+  invisible(meta)
+}
+
+run_xcell_fisher_meta <- function(
+  diff_list,
+  output_dir,
+  file_prefix = "xcell",
+  p_cutoff = 0.05,
+  min_cohorts = 2L,
+  export_plots = TRUE
+) {
+  meta <- run_xcell_risk_meta_pbine(
+    diff_list = diff_list,
+    output_dir = output_dir,
+    file_prefix = file_prefix,
+    p_cutoff = p_cutoff,
+    method = "Fisher",
+    min_cohorts = min_cohorts,
+    export_plots = export_plots
+  )
+
+  fisher_path <- file.path(output_dir, paste0(file_prefix, "_meta_fisher.csv"))
+  pbine_path <- file.path(output_dir, paste0(file_prefix, "_meta_pbine.csv"))
+  if (file.exists(pbine_path)) {
+    file.copy(pbine_path, fisher_path, overwrite = TRUE)
+    message("Wrote ", fisher_path)
+  }
+  invisible(meta)
+}
+
+run_xcell_combined_hl_g1g4_fisher_meta <- function(
+  hl_diff_list,
+  g1g4_diff_list,
+  output_dir,
+  file_prefix = "xcell_highlow_plus_g1g4",
+  p_cutoff = 0.05,
+  min_cohorts = 2L
+) {
+  if (!requireNamespace("readr", quietly = TRUE)) library(readr)
+  if (!requireNamespace("dplyr", quietly = TRUE)) library(dplyr)
+
+  dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+  meta_hl <- run_xcell_fisher_meta(
+    hl_diff_list,
+    output_dir = output_dir,
+    file_prefix = "xcell_high_vs_low",
+    p_cutoff = p_cutoff,
+    min_cohorts = min_cohorts,
+    export_plots = TRUE
+  )
+  meta_g1 <- run_xcell_fisher_meta(
+    g1g4_diff_list,
+    output_dir = output_dir,
+    file_prefix = "xcell_g1_vs_g4",
+    p_cutoff = p_cutoff,
+    min_cohorts = min_cohorts,
+    export_plots = TRUE
+  )
+
+  shared <- intersect(meta_hl$cell_type, meta_g1$cell_type)
+  if (length(shared) == 0L) {
+    stop("No shared cell types between High/Low and G1/G4 meta results.")
+  }
+
+  hl_p <- meta_hl$meta_p[match(shared, meta_hl$cell_type)]
+  g1_p <- meta_g1$meta_p[match(shared, meta_g1$cell_type)]
+  pm2 <- cbind(hl_p, g1_p)
+  colnames(pm2) <- c("high_vs_low", "g1_vs_g4")
+  rownames(pm2) <- shared
+
+  combined_p <- fisher_combine_pval_matrix(pm2)
+  mean_hl <- meta_hl$mean_log2FC[match(shared, meta_hl$cell_type)]
+  mean_g1 <- meta_g1$mean_log2FC[match(shared, meta_g1$cell_type)]
+  mean_combined <- rowMeans(cbind(mean_hl, mean_g1), na.rm = TRUE)
+
+  combined <- data.frame(
+    cell_type = shared,
+    meta_p = combined_p,
+    meta_p_high_vs_low = hl_p,
+    meta_p_g1_vs_g4 = g1_p,
+    mean_log2FC_high_vs_low = mean_hl,
+    mean_log2FC_g1_vs_g4 = mean_g1,
+    mean_log2FC = mean_combined,
+    n_inputs = apply(pm2, 1, function(row) sum(is.finite(row))),
+    stringsAsFactors = FALSE
+  )
+  combined <- combined[order(combined$meta_p), ]
+
+  out_path <- file.path(output_dir, paste0(file_prefix, "_meta_fisher.csv"))
+  readr::write_csv(combined, out_path)
+  message("Wrote combined Fisher meta: ", out_path)
+  message(
+    "Combined meta p < ", p_cutoff, ": ",
+    sum(combined$meta_p < p_cutoff, na.rm = TRUE)
+  )
+
+  export_xcell_risk_meta_dotplot(combined, output_dir, file_prefix, p_cutoff)
+  export_xcell_risk_meta_volcano(combined, output_dir, file_prefix, p_cutoff)
+
+  invisible(list(
+    high_vs_low = meta_hl,
+    g1_vs_g4 = meta_g1,
+    combined = combined
+  ))
+}
+
+export_xcell_risk_meta_dotplot <- function(
+  meta,
+  output_dir,
+  file_prefix = "xcell_high_vs_low",
+  p_cutoff = 0.05,
+  top_n = 20,
+  width = 10,
+  height = NULL
+) {
+  if (!requireNamespace("ggplot2", quietly = TRUE)) {
+    stop("Package 'ggplot2' is required for meta dot plots.")
+  }
+
+  plot_df <- meta %>%
+    dplyr::filter(.data$meta_p < p_cutoff) %>%
+    dplyr::arrange(.data$meta_p, dplyr::desc(abs(.data$mean_log2FC))) %>%
+    dplyr::slice_head(n = top_n)
+
+  if (nrow(plot_df) == 0) {
+    plot_df <- meta %>%
+      dplyr::arrange(.data$meta_p, dplyr::desc(abs(.data$mean_log2FC))) %>%
+      dplyr::slice_head(n = top_n)
+  }
+
+  plot_df$cell_type <- factor(
+    plot_df$cell_type,
+    levels = plot_df$cell_type[order(plot_df$mean_log2FC, decreasing = TRUE)]
+  )
+
+  title <- paste0(file_prefix, " meta — Fisher xCell2")
+  subtitle <- if (any(meta$meta_p < p_cutoff, na.rm = TRUE)) {
+    paste0("p < ", p_cutoff, "; top ", nrow(plot_df), " by |mean log2FC|")
+  } else {
+    paste0("No p < ", p_cutoff, "; top ", nrow(plot_df), " by rank")
+  }
+
+  p <- ggplot2::ggplot(
+    plot_df,
+    ggplot2::aes(
+      x = .data$mean_log2FC,
+      y = .data$cell_type,
+      size = -log10(pmax(.data$meta_p, .Machine$double.xmin)),
+      colour = .data$meta_p < p_cutoff
+    )
+  ) +
+    ggplot2::geom_point(alpha = 0.85) +
+    ggplot2::geom_vline(xintercept = 0, linetype = "dashed", colour = "grey50") +
+    ggplot2::scale_colour_manual(
+      values = c(`TRUE` = "#B2182B", `FALSE` = "grey55"),
+      labels = c(`TRUE` = paste0("p < ", p_cutoff), `FALSE` = "Not sig."),
+      name = NULL
+    ) +
+    ggplot2::scale_size_continuous(range = c(3, 10), name = expression(-log[10] * "(p)")) +
+    ggplot2::labs(
+      title = title,
+      subtitle = subtitle,
+      x = "Mean log2FC (High / Low) across cohorts",
+      y = NULL
+    ) +
+    ggplot2::theme_bw(base_size = 11) +
+    ggplot2::theme(
+      plot.title = ggplot2::element_text(face = "bold"),
+      legend.position = "bottom"
+    )
+
+  if (is.null(height)) {
+    height <- max(5, 0.35 * nrow(plot_df) + 2)
+  }
+  png_path <- file.path(output_dir, paste0(file_prefix, "_meta_pbine_dotplot.png"))
+  ggplot2::ggsave(png_path, p, width = width, height = height, dpi = 150)
+  message("Wrote ", png_path)
+  invisible(png_path)
+}
+
+export_xcell_risk_meta_volcano <- function(
+  meta,
+  output_dir,
+  file_prefix = "xcell_high_vs_low",
+  p_cutoff = 0.05,
+  fc_cutoff = 0.5,
+  width = 10,
+  height = 7
+) {
+  if (!requireNamespace("ggplot2", quietly = TRUE)) {
+    stop("Package 'ggplot2' is required for meta volcano plots.")
+  }
+
+  plot_df <- meta %>%
+    dplyr::filter(is.finite(.data$mean_log2FC), is.finite(.data$meta_p)) %>%
+    dplyr::mutate(
+      neg_log10_p = -log10(pmax(.data$meta_p, .Machine$double.xmin)),
+      sig = .data$meta_p < p_cutoff & abs(.data$mean_log2FC) > fc_cutoff
+    )
+  if (nrow(plot_df) == 0) {
+    message("No data for meta volcano.")
+    return(invisible(NULL))
+  }
+
+  xmax <- min(3, max(1.25, stats::quantile(abs(plot_df$mean_log2FC), 0.98, na.rm = TRUE) * 1.15))
+  ymax <- max(1.5, max(plot_df$neg_log10_p, na.rm = TRUE) * 1.08)
+  label_df <- plot_df %>%
+    dplyr::arrange(.data$meta_p, dplyr::desc(abs(.data$mean_log2FC))) %>%
+    dplyr::slice_head(n = 12)
+
+  p <- ggplot2::ggplot(
+    plot_df,
+    ggplot2::aes(x = .data$mean_log2FC, y = .data$neg_log10_p, colour = .data$sig)
+  ) +
+    ggplot2::geom_point(size = 2.5, alpha = 0.75) +
+    ggplot2::geom_vline(xintercept = c(-fc_cutoff, fc_cutoff), linetype = "dashed", colour = "grey70") +
+    ggplot2::geom_hline(yintercept = -log10(p_cutoff), linetype = "dashed", colour = "grey70") +
+    ggplot2::scale_colour_manual(values = c(`TRUE` = "#B2182B", `FALSE` = "grey60")) +
+    ggplot2::coord_cartesian(xlim = c(-xmax, xmax), ylim = c(0, ymax)) +
+    ggplot2::labs(
+      title = paste0(file_prefix, " meta volcano — Fisher xCell2"),
+      subtitle = paste0(
+        "Stage2 + Retrospective + Colossus + Taxonomy | ",
+        sum(plot_df$sig, na.rm = TRUE), " sig at p<", p_cutoff, " & |log2FC|>", fc_cutoff
+      ),
+      x = "Mean log2FC",
+      y = expression(-log[10] * "(meta p-value)"),
+      colour = NULL
+    ) +
+    ggplot2::theme_bw(base_size = 11) +
+    ggplot2::theme(
+      plot.title = ggplot2::element_text(face = "bold"),
+      legend.position = "none"
+    )
+
+  if (requireNamespace("ggrepel", quietly = TRUE)) {
+    p <- p + ggrepel::geom_text_repel(
+      data = label_df,
+      ggplot2::aes(label = .data$cell_type),
+      size = 3,
+      max.overlaps = 20,
+      show.legend = FALSE
+    )
+  }
+
+  png_path <- file.path(output_dir, paste0(file_prefix, "_meta_pbine_volcano.png"))
+  ggplot2::ggsave(png_path, p, width = width, height = height, dpi = 150, bg = "white")
   message("Wrote ", png_path)
   invisible(png_path)
 }

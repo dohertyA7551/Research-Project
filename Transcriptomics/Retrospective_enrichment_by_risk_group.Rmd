@@ -85,16 +85,7 @@ if (length(unmapped) > 0) {
   cat("Excluded (no proteomics risk assignment):", paste(unmapped, collapse = ", "), "\n")
 }
 
-differential_results <- scores_long %>%
-  group_by(cell_type) %>%
-  summarise(
-    mean_high = mean(enrichment[risk_grp == "High"], na.rm = TRUE),
-    mean_low  = mean(enrichment[risk_grp == "Low"], na.rm = TRUE),
-    log2FC    = log2((mean_high + 1e-10) / (mean_low + 1e-10)),
-    pval      = wilcox.test(enrichment ~ risk_grp)$p.value,
-    .groups   = "drop"
-  ) %>%
-  mutate(neg_log10_p = -log10(pval))
+differential_results <- wilcox_enrichment_diff(scores_long)
 
 differential_results_clean <- differential_results[
   is.finite(differential_results$log2FC) & !is.na(differential_results$pval),

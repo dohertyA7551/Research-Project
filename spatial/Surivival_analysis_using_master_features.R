@@ -49,6 +49,7 @@ print(leiden_cols)
 #####merge RCSI and Taxonomy clinical data
 clin_all <- bind_rows(clin_a, clin_b)
 
+saveRDS(clin_all, file= "RCSI_Taxonomy_clinical_merged.rds")
 ss_patient_map <- clin_all %>%
   select(SS, Patient) %>%   # TMA ID and patient ID
   distinct()   
@@ -138,7 +139,7 @@ cat("dss_event:\n"); print(table(merged_df_clean$dss_event, useNA = "always"))
 cat("dfs_event:\n"); print(table(merged_df_clean$dfs_event, useNA = "always"))
 
 saveRDS(merged_df, file="RCSI_Taxonomy_clin_prot_merged_df.rds")
-
+merged_df <-readRDS(file= "RCSI-Taxonomy_clin_prot_merged_df.rds")
 cat("\nPatients before filtering:", nrow(merged_df), "\n")
 
 merged_df_dfs <- merged_df %>%

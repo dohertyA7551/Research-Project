@@ -246,27 +246,10 @@ cat("Samples with risk group:\n")
 print(table(scores_long$sample, scores_long$risk_grp))
 
 # High vs Low differential enrichment (Wilcoxon per cell type)
-differential_results <- scores_long %>%
-  group_by(cell_type) %>%
-  summarise(
-    mean_high = mean(enrichment[risk_grp == "High"], na.rm = TRUE),
-    mean_low  = mean(enrichment[risk_grp == "Low"], na.rm = TRUE),
-    log2FC    = log2((mean_high + 1e-10) / (mean_low + 1e-10)),
-    pval      = wilcox.test(enrichment ~ risk_grp)$p.value,
-    .groups   = "drop"
-  ) %>%
-  mutate(neg_log10_p = -log10(pval))
+differential_results <- wilcox_enrichment_diff(scores_long)
 
 print(differential_results %>%
         filter(cell_type %in% c("B cell", "Exhausted CD8+ T cells")))
-```
-
-```{r export-top-log2fc}
-top_fc_table <- export_top_log2fc_table(
-  differential_results,
-  file.path(output_dir, "Stage2_top5_log2fc_up_down.csv")
-)
-print(top_fc_table)
 ```
 
 ```{r}

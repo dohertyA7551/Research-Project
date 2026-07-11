@@ -15,6 +15,8 @@ library(tidyverse)
 #}
 #devtools::install_github("AlmogAngel/xCell2")
 
+  
+
 
 setwd("/work_space/files/Transcriptomics")
 ##exp matrix in correct orientation 
@@ -188,7 +190,7 @@ merged_df <- merge(
   by = "patient_id",
   all = FALSE
 )
-
+wih
 
 
 cor.test(
