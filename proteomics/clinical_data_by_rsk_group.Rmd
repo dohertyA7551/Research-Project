@@ -120,6 +120,78 @@ p_age_violin <- ggplot(clin_patient, aes(x = risk_grp, y = age, fill = risk_grp)
 p_age_violin
 ```
 
+```{r}
+##sex
+clin_patient <- clin_risk %>%
+  group_by(patient_id) %>%
+  summarise(
+    age      = first(age[!is.na(age)]),
+    risk_grp = first(risk_grp[!is.na(risk_grp)]),
+    sex      = first(sex[!is.na(sex)]),
+    .groups = "drop"
+  )
+
+table(clin_patient$risk_grp, clin_patient$sex, useNA = "ifany")
+# Chi-square test on sex distribution across risk groups
+sex_tab <- table(clin_patient$risk_grp, clin_patient$sex, useNA = "ifany")
+sex_tab
+
+chisq.test(sex_tab)
+# if expected counts <5 anywhere:
+fisher.test(sex_tab)
+
+library(ggplot2)
+library(dplyr)
+
+colours <- c("Low" = "#004B23", "High" = "#800000")
+
+# ── Sex distribution plot (patient-level, deduplicated) ──────────────────────
+sex_df <- clin_patient %>%
+  filter(!is.na(sex), !is.na(risk_grp)) %>%
+  count(risk_grp, sex) %>%
+  group_by(risk_grp) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  ungroup()
+
+# Chi-square (with Fisher/simulated fallback for small counts)
+sex_tab <- table(
+  clin_patient$risk_grp[!is.na(clin_patient$sex) & !is.na(clin_patient$risk_grp)],
+  clin_patient$sex[!is.na(clin_patient$sex) & !is.na(clin_patient$risk_grp)]
+)
+
+pval <- tryCatch(
+  chisq.test(sex_tab)$p.value,
+  warning = function(w) chisq.test(sex_tab, simulate.p.value = TRUE)$p.value,
+  error   = function(e) NA_real_
+)
+
+p_lab <- dplyr::case_when(
+  is.na(pval)  ~ "p = NA",
+  pval < 0.001 ~ "p < 0.001",
+  pval < 0.01  ~ paste0("p = ", round(pval, 3)),
+  TRUE         ~ paste0("p = ", round(pval, 2))
+)
+
+p_sex <- ggplot(sex_df, aes(x = sex, y = pct, fill = risk_grp)) +
+  geom_col(position = "dodge", colour = "white", linewidth = 0.3) +
+  geom_text(
+    aes(label = paste0(round(pct, 1), "%")),
+    position = position_dodge(width = 0.9),
+    vjust = -0.3, size = 3
+  ) +
+  scale_fill_manual(values = colours) +
+  scale_y_continuous(limits = c(0, max(sex_df$pct) * 1.25)) +
+  annotate("text",
+           x = Inf, y = Inf, label = p_lab,
+           hjust = 1.1, vjust = 1.5,
+           size = 3.2, colour = "grey30") +
+  labs(title = "Sex Distribution by Risk Group",
+       x = "", y = "% within risk group", fill = "Risk Group") +
+  theme_classic(base_size = 11) +
+  theme(plot.title = element_text(face = "bold", size = 10))
+
+p_sex
+```
 
 ```{r}
 
@@ -576,4 +648,178 @@ cox_fit_reduced <- coxph(
 summary(cox_fit_reduced)
 ```
 
+```{r}
+
+clin_patient <- clin_risk %>%
+  group_by(patient_id) %>%
+  summarise(
+    age         = first(age[!is.na(age)]),
+    risk_grp    = first(risk_grp[!is.na(risk_grp)]),
+    sex         = first(sex[!is.na(sex)]),
+    cancer_type = first(cancer_type[!is.na(cancer_type)]),
+    has_adj     = first(has_adjuvant_chemotherapy[!is.na(has_adjuvant_chemotherapy)]),
+    has_neoadj  = first(has_neoadjuvant_chemoradiotherapy[!is.na(has_neoadjuvant_chemoradiotherapy)]),
+    .groups = "drop"
+  )
+
+to_logical <- function(x) {
+  x_chr <- tolower(trimws(as.character(x)))
+  dplyr::case_when(
+    x_chr == "yes" ~ TRUE,
+    x_chr == "no"  ~ FALSE,
+    TRUE ~ NA
+  )
+}
+
+clin_patient <- clin_patient %>%
+  mutate(
+    has_adj    = to_logical(has_adj),
+    has_neoadj = to_logical(has_neoadj),
+    treatment_status = case_when(
+      has_adj | has_neoadj ~ "Treated",
+      !has_adj & !has_neoadj ~ "Untreated",
+      TRUE ~ NA_character_
+    )
+  )
+
+colours <- c("Low" = "#004B23", "High" = "#800000")
+
+cancer_type_df <- clin_patient %>%
+  filter(!is.na(cancer_type), !is.na(risk_grp), cancer_type %in% c("COAD", "READ")) %>%
+  mutate(cancer_type = recode(cancer_type,
+                               "COAD" = "Colon",
+                               "READ" = "Rectal")) %>%
+  count(risk_grp, cancer_type) %>%
+  group_by(risk_grp) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  ungroup()
+
+cancer_type_tab <- table(
+  clin_patient$risk_grp[clin_patient$cancer_type %in% c("COAD", "READ")],
+  clin_patient$cancer_type[clin_patient$cancer_type %in% c("COAD", "READ")]
+)
+
+pval_ct <- tryCatch(
+  chisq.test(cancer_type_tab)$p.value,
+  warning = function(w) chisq.test(cancer_type_tab, simulate.p.value = TRUE)$p.value,
+  error   = function(e) NA_real_
+)
+
+p_lab_ct <- dplyr::case_when(
+  is.na(pval_ct)  ~ "p = NA",
+  pval_ct < 0.001 ~ "p < 0.001",
+  pval_ct < 0.01  ~ paste0("p = ", round(pval_ct, 3)),
+  TRUE            ~ paste0("p = ", round(pval_ct, 2))
+)
+
+p_cancer_type <- ggplot(cancer_type_df, aes(x = cancer_type, y = pct, fill = risk_grp)) +
+  geom_col(position = "dodge", colour = "white", linewidth = 0.3) +
+  geom_text(
+    aes(label = paste0(round(pct, 1), "%")),
+    position = position_dodge(width = 0.9),
+    vjust = -0.3, size = 3
+  ) +
+  scale_fill_manual(values = colours) +
+  scale_y_continuous(limits = c(0, max(cancer_type_df$pct) * 1.25)) +
+  annotate("text",
+           x = Inf, y = Inf, label = p_lab_ct,
+           hjust = 1.1, vjust = 1.5,
+           size = 4.5, colour = "grey30") +
+  labs(title = "Tumour Site by Risk Group",
+       x = "", y = "% within risk group", fill = "Risk Group") +
+  theme_classic(base_size = 11) +
+  theme(plot.title = element_text(face = "bold", size = 10))
+
+p_cancer_type
+
+treat_df <- clin_patient %>%
+  filter(!is.na(treatment_status), !is.na(risk_grp)) %>%
+  count(risk_grp, treatment_status) %>%
+  group_by(risk_grp) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  ungroup()
+
+treat_tab <- table(
+  clin_patient$risk_grp[!is.na(clin_patient$treatment_status) & !is.na(clin_patient$risk_grp)],
+  clin_patient$treatment_status[!is.na(clin_patient$treatment_status) & !is.na(clin_patient$risk_grp)]
+)
+
+pval_treat <- tryCatch(
+  chisq.test(treat_tab)$p.value,
+  warning = function(w) chisq.test(treat_tab, simulate.p.value = TRUE)$p.value,
+  error   = function(e) NA_real_
+)
+
+p_lab_treat <- dplyr::case_when(
+  is.na(pval_treat)  ~ "p = NA",
+  pval_treat < 0.001 ~ "p < 0.001",
+  pval_treat < 0.01  ~ paste0("p = ", round(pval_treat, 3)),
+  TRUE               ~ paste0("p = ", round(pval_treat, 2))
+)
+
+p_treatment <- ggplot(treat_df, aes(x = treatment_status, y = pct, fill = risk_grp)) +
+  geom_col(position = "dodge", colour = "white", linewidth = 0.3) +
+  geom_text(
+    aes(label = paste0(round(pct, 1), "%")),
+    position = position_dodge(width = 0.9),
+    vjust = -0.3, size = 3
+  ) +
+  scale_fill_manual(values = colours) +
+  scale_y_continuous(limits = c(0, max(treat_df$pct) * 1.25)) +
+  annotate("text",
+           x = Inf, y = Inf, label = p_lab_treat,
+           hjust = 1.1, vjust = 1.5,
+           size = 4.5, colour = "grey30") +
+  labs(title = "Treatment Status by Risk Group",
+       x = "", y = "% within risk group", fill = "Risk Group") +
+  theme_classic(base_size = 11) +
+  theme(plot.title = element_text(face = "bold", size = 10))
+
+p_treatment
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(readr)
+
+plot_hallmark_dotplot <- function(csv_path, cohort_title) {
+  df <- read_csv(csv_path, show_col_types = FALSE)
+
+  df$pathway <- gsub("^HALLMARK_", "", df$pathway)
+  df$pathway <- gsub("_", " ", df$pathway)
+  df$direction <- ifelse(df$NES > 0, "High > Low", "High < Low")
+  df$pathway <- factor(
+    df$pathway,
+    levels = df$pathway[order(df$NES, decreasing = TRUE)]
+  )
+
+  ggplot(df, aes(x = NES, y = pathway, colour = -log10(padj), size = size)) +
+    geom_point() +
+    geom_vline(xintercept = 0, linetype = "dashed", colour = "grey50") +
+    scale_colour_gradient(low = "#4575b4", high = "#d73027") +
+    labs(
+      title = paste0(cohort_title, " — fgsea hallmark (High vs Low risk)"),
+      subtitle = paste0("FDR < 0.05; ", nrow(df), " pathways"),
+      x = "Normalized enrichment score (NES)",
+      y = NULL,
+      colour = expression(-log[10] * "(FDR)"),
+      size = "Set size"
+    ) +
+    theme_bw(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold"),
+      axis.text.y = element_text(size = 10)
+    )
+}
+p_legacy_hallmark <- plot_hallmark_dotplot(
+  "/work_space/files/Transcriptomics/analysis_output/legacy_combined/Legacy_fgsea_hallmark_fdr05.csv", "Legacy"
+)
+p_taxonomy_hallmark <- plot_hallmark_dotplot(
+  "/work_space/files/Transcriptomics/analysis_output/taxonomy/Taxonomy_fgsea_hallmark_fdr05.csv", "Taxonomy"
+)
+
+print(p_legacy_hallmark)
+print(p_taxonomy_hallmark)
+```
 

@@ -1,0 +1,550 @@
+---
+title: "Adjuvant-treated patients: RSF metacluster risk vs DFS relapse"
+output: html_notebook
+---
+
+Among **adjuvant-treated** patients, test whether **RSF-derived metacluster risk** and underlying **metacluster composition** differ between those who **relapse** (`dfs_event = 1`) and those who **do not** (`dfs_event = 0`).
+
+**Risk definition (pre-computed):** `survival_df_with_risk.rds` from `RCSI_Taxonomy_Combined_prognosis_scores.Rmd`
+
+- **`rsf_risk`:** predicted risk from random survival forest (`randomForestSRC`) fit on metacluster probability columns.
+- **`risk_grp`:** Low / High from optimal DFS cutpoint on `rsf_risk` (`survminer::surv_cutpoint`, min group size 15%).
+
+**Inclusion:** `has_adjuvant_chemotherapy == "yes"`, valid `dfs_months > 0`, non-missing `dfs_event`, and non-missing RSF risk.
+
+**Outputs:** `results/adjuvant_metacluster_relapse/` (CSVs + PNG/PDF figures).
+
+Knit from the `proteomics/` directory.
+
+```{r setup}
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(tibble)
+library(readr)
+library(stringr)
+library(ggplot2)
+library(ggpubr)
+library(survival)
+library(broom)
+
+if (requireNamespace("pheatmap", quietly = TRUE)) library(pheatmap)
+
+output_dir <- "results/adjuvant_metacluster_relapse"
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+save_csv <- function(x, name) {
+  path <- file.path(output_dir, name)
+  write_csv(x, path)
+  message("Saved: ", path)
+}
+
+save_plot <- function(p, name, width = 7, height = 6) {
+  png_path <- file.path(output_dir, sub("\\.pdf$", ".png", name))
+  pdf_path <- file.path(output_dir, sub("\\.png$", ".pdf", name))
+  ggsave(png_path, p, width = width, height = height, dpi = 300, bg = "white")
+  ggsave(pdf_path, p, width = width, height = height, bg = "white")
+  message("Saved: ", png_path)
+}
+```
+
+```{r load-data}
+merged_df <- readRDS("RCSI_Taxonomy_clin_prot_merged_df.rds")
+survival_df <- readRDS("survival_df_with_risk.rds")
+
+stopifnot(all(c("patient_id", "rsf_risk", "risk_grp") %in% names(survival_df)))
+
+leiden_cols_all <- grep(
+  "abundance_metacluster_leiden",
+  colnames(merged_df),
+  value = TRUE
+)
+
+cat("Merged cohort:", nrow(merged_df), "patients\n")
+cat("RSF risk table:", nrow(survival_df), "patients\n")
+cat("Metacluster columns:", length(leiden_cols_all), "\n")
+print(table(survival_df$risk_grp, useNA = "ifany"))
+```
+
+```{r define-cohort}
+adj_df <- merged_df %>%
+  filter(
+    has_adjuvant_chemotherapy == "yes",
+    !is.na(dfs_months),
+    dfs_months > 0,
+    !is.na(dfs_event)
+  ) %>%
+  left_join(
+    survival_df %>%
+      select(patient_id, rsf_risk, risk_grp, dfs_months, dfs_event),
+    by = "patient_id",
+    suffix = c("", "_rsf")
+  ) %>%
+  filter(!is.na(rsf_risk), !is.na(risk_grp)) %>%
+  mutate(
+    relapse_status = factor(
+      dfs_event,
+      levels = c(0, 1),
+      labels = c("No relapse", "Relapse")
+    ),
+    risk_grp = factor(risk_grp, levels = c("Low", "High"))
+  )
+
+zero_frac <- colMeans(adj_df[, leiden_cols_all] == 0, na.rm = TRUE)
+leiden_cols <- leiden_cols_all[zero_frac < 1]
+
+cat("\nAdjuvant-treated patients with RSF risk:", nrow(adj_df), "\n")
+print(table(adj_df$relapse_status, adj_df$risk_grp))
+
+cat("\nRelapse rate by RSF risk group:\n")
+relapse_rate_table <- adj_df %>%
+  group_by(risk_grp) %>%
+  summarise(
+    n = n(),
+    n_relapse = sum(dfs_event == 1),
+    relapse_rate = mean(dfs_event == 1),
+    .groups = "drop"
+  )
+print(relapse_rate_table)
+save_csv(relapse_rate_table, "adjuvant_rsf_risk_group_relapse_rates.csv")
+```
+
+```{r rsf-score-tests}
+wt_risk <- wilcox.test(
+  adj_df$rsf_risk[adj_df$dfs_event == 1],
+  adj_df$rsf_risk[adj_df$dfs_event == 0],
+  exact = FALSE
+)
+
+cat("\n=== Wilcoxon: rsf_risk (Relapse vs No relapse) ===\n")
+cat("  Median rsf_risk (Relapse):   ", median(adj_df$rsf_risk[adj_df$dfs_event == 1]), "\n")
+cat("  Median rsf_risk (No relapse):", median(adj_df$rsf_risk[adj_df$dfs_event == 0]), "\n")
+cat("  p-value:", format(wt_risk$p.value, digits = 3), "\n")
+
+glm_risk <- glm(dfs_event ~ rsf_risk, data = adj_df, family = binomial())
+glm_tidy <- tidy(glm_risk, conf.int = TRUE, exponentiate = TRUE)
+
+cat("\n=== Logistic regression: dfs_event ~ rsf_risk ===\n")
+print(glm_tidy)
+save_csv(glm_tidy, "adjuvant_rsf_risk_logistic_regression.csv")
+
+tbl_risk <- table(
+  Relapse = adj_df$relapse_status,
+  RSF_risk = adj_df$risk_grp
+)
+
+cat("\n=== RSF risk group vs relapse ===\n")
+print(tbl_risk)
+
+chi_risk <- chisq.test(tbl_risk)
+fisher_risk <- fisher.test(tbl_risk)
+
+relapse_table <- adj_df %>%
+  count(risk_grp, relapse_status) %>%
+  pivot_wider(names_from = relapse_status, values_from = n, values_fill = 0) %>%
+  mutate(
+    n_total = `No relapse` + Relapse,
+    relapse_rate_pct = round(100 * Relapse / n_total, 1)
+  )
+
+save_csv(relapse_table, "adjuvant_rsf_risk_group_relapse_table.csv")
+
+results_summary <- tibble(
+  test = c(
+    "Wilcoxon rsf_risk",
+    "Logistic rsf_risk OR",
+    "Chi-square risk_grp",
+    "Fisher risk_grp OR"
+  ),
+  statistic = c(
+    NA_real_,
+    glm_tidy$estimate[glm_tidy$term == "rsf_risk"],
+    chi_risk$statistic,
+    fisher_risk$estimate
+  ),
+  p_value = c(
+    wt_risk$p.value,
+    glm_tidy$p.value[glm_tidy$term == "rsf_risk"],
+    chi_risk$p.value,
+    fisher_risk$p.value
+  )
+)
+
+save_csv(results_summary, "adjuvant_rsf_risk_relapse_tests.csv")
+print(results_summary)
+```
+
+```{r rsf-score-boxplot}
+relapse_colours <- c("No relapse" = "#1B4332", "Relapse" = "#B2182B")
+
+p_score <- ggplot(adj_df, aes(x = relapse_status, y = rsf_risk, fill = relapse_status)) +
+  geom_boxplot(alpha = 0.85, outlier.shape = 21) +
+  geom_jitter(width = 0.12, alpha = 0.35, size = 1.2) +
+  scale_fill_manual(values = relapse_colours) +
+  stat_compare_means(method = "wilcox.test", label = "p.format", size = 4) +
+  labs(
+    title = "RSF metacluster risk score by relapse status",
+    subtitle = paste0(
+      "Adjuvant-treated only | n = ", nrow(adj_df),
+      " (No relapse ", sum(adj_df$dfs_event == 0),
+      ", Relapse ", sum(adj_df$dfs_event == 1), ")"
+    ),
+    x = NULL,
+    y = "RSF predicted risk (rsf_risk)"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"), legend.position = "none")
+
+print(p_score)
+save_plot(p_score, "adjuvant_rsf_risk_by_relapse_boxplot.png")
+```
+
+```{r risk-group-barplot}
+relapse_by_group <- adj_df %>%
+  count(risk_grp, relapse_status) %>%
+  group_by(risk_grp) %>%
+  mutate(pct = n / sum(n) * 100)
+
+p_bar <- ggplot(relapse_by_group, aes(x = risk_grp, y = pct, fill = relapse_status)) +
+  geom_col(position = "stack", colour = "white", linewidth = 0.3) +
+  scale_fill_manual(values = relapse_colours, name = NULL) +
+  scale_y_continuous(labels = function(x) paste0(x, "%"), expand = expansion(mult = c(0, 0.02))) +
+  labs(
+    title = "Relapse proportion by RSF risk group",
+    subtitle = "Adjuvant-treated patients only",
+    x = "RSF risk group",
+    y = "Percentage within group"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"), legend.position = "bottom")
+
+print(p_bar)
+save_plot(p_bar, "adjuvant_rsf_risk_group_relapse_barplot.png")
+```
+
+```{r km-adjuvant-subset}
+km_adj <- survfit(Surv(dfs_months, dfs_event) ~ risk_grp, data = adj_df)
+
+if (requireNamespace("survminer", quietly = TRUE)) {
+  p_km <- survminer::ggsurvplot(
+    km_adj,
+    data = adj_df,
+    pval = TRUE,
+    risk.table = TRUE,
+    palette = c("#004B23", "#800000"),
+    legend.labs = c("Low", "High"),
+    legend.title = "RSF risk",
+    xlab = "Time (months)",
+    ylab = "DFS probability",
+    title = "DFS in adjuvant-treated patients by RSF risk group",
+    ggtheme = theme_minimal()
+  )
+  print(p_km)
+
+  km_png <- file.path(output_dir, "adjuvant_rsf_risk_km_curve.png")
+  km_pdf <- file.path(output_dir, "adjuvant_rsf_risk_km_curve.pdf")
+  png(km_png, width = 9, height = 8, units = "in", res = 300)
+  print(p_km)
+  dev.off()
+  pdf(km_pdf, width = 9, height = 8)
+  print(p_km)
+  dev.off()
+  message("Saved: ", km_png)
+}
+
+logrank_adj <- survdiff(Surv(dfs_months, dfs_event) ~ risk_grp, data = adj_df)
+cat("\nLog-rank (adjuvant subset):\n")
+print(logrank_adj)
+```
+
+```{r mc-per-cluster-wilcoxon}
+mc_prob_stats <- map_dfr(leiden_cols, function(col) {
+  pr <- adj_df[[col]][adj_df$dfs_event == 1]
+  pn <- adj_df[[col]][adj_df$dfs_event == 0]
+  pr <- pr[!is.na(pr)]
+  pn <- pn[!is.na(pn)]
+
+  if (length(pr) < 2 || length(pn) < 2) {
+    return(tibble(column = col, metacluster = NA_character_, p_value = NA_real_))
+  }
+
+  wt <- wilcox.test(pr, pn, exact = FALSE)
+
+  tibble(
+    column = col,
+    metacluster = gsub("abundance_metacluster_leiden_1.0_", "", col),
+    mean_relapse = mean(pr),
+    mean_no_relapse = mean(pn),
+    median_relapse = median(pr),
+    median_no_relapse = median(pn),
+    delta_mean = mean(pr) - mean(pn),
+    cor_rsf = cor(adj_df[[col]], adj_df$rsf_risk, use = "complete.obs"),
+    p_value = wt$p.value
+  )
+}) %>%
+  mutate(adj_p_value = p.adjust(p_value, method = "BH")) %>%
+  arrange(p_value)
+
+save_csv(mc_prob_stats, "adjuvant_mc_relapse_wilcoxon.csv")
+
+cat("\nMetaclusters tested:", sum(is.finite(mc_prob_stats$p_value)), "\n")
+cat("Raw p < 0.05:", sum(mc_prob_stats$p_value < 0.05, na.rm = TRUE), "\n")
+cat("FDR < 0.10:", sum(mc_prob_stats$adj_p_value < 0.10, na.rm = TRUE), "\n")
+cat("\nTop 10 by raw p-value:\n")
+print(head(mc_prob_stats, 10))
+```
+
+```{r mc-composite-tests}
+composite_results <- tibble(test = character(), statistic = double(), p_value = double())
+
+if (file.exists("mc_event_both.rds") && file.exists("mc_noevent_both.rds")) {
+  bad_cols <- intersect(readRDS("mc_event_both.rds"), leiden_cols)
+  good_cols <- intersect(readRDS("mc_noevent_both.rds"), leiden_cols)
+
+  adj_df <- adj_df %>%
+    mutate(
+      bad_mc_sum = rowSums(across(all_of(bad_cols)), na.rm = TRUE),
+      good_mc_sum = rowSums(across(all_of(good_cols)), na.rm = TRUE),
+      bad_minus_good = bad_mc_sum - good_mc_sum
+    )
+
+  wt_bad <- wilcox.test(
+    adj_df$bad_mc_sum[adj_df$dfs_event == 1],
+    adj_df$bad_mc_sum[adj_df$dfs_event == 0],
+    exact = FALSE
+  )
+  wt_good <- wilcox.test(
+    adj_df$good_mc_sum[adj_df$dfs_event == 1],
+    adj_df$good_mc_sum[adj_df$dfs_event == 0],
+    exact = FALSE
+  )
+  wt_comp <- wilcox.test(
+    adj_df$bad_minus_good[adj_df$dfs_event == 1],
+    adj_df$bad_minus_good[adj_df$dfs_event == 0],
+    exact = FALSE
+  )
+
+  composite_results <- tibble(
+    test = c(
+      "Event-enriched MC sum",
+      "No-event-enriched MC sum",
+      "Bad minus good composite"
+    ),
+    statistic = c(
+      median(adj_df$bad_mc_sum[adj_df$dfs_event == 1]) -
+        median(adj_df$bad_mc_sum[adj_df$dfs_event == 0]),
+      median(adj_df$good_mc_sum[adj_df$dfs_event == 1]) -
+        median(adj_df$good_mc_sum[adj_df$dfs_event == 0]),
+      median(adj_df$bad_minus_good[adj_df$dfs_event == 1]) -
+        median(adj_df$bad_minus_good[adj_df$dfs_event == 0])
+    ),
+    p_value = c(wt_bad$p.value, wt_good$p.value, wt_comp$p.value)
+  )
+
+  save_csv(composite_results, "adjuvant_mc_composite_relapse_tests.csv")
+  print(composite_results)
+}
+```
+
+```{r mc-global-pca-test}
+prob_mat <- as.matrix(adj_df[, leiden_cols])
+pca <- prcomp(prob_mat, center = TRUE, scale. = FALSE)
+
+n_pc <- min(5, ncol(prob_mat))
+pc_df <- as.data.frame(pca$x[, seq_len(n_pc), drop = FALSE])
+pc_df$relapse <- adj_df$dfs_event
+
+pc_formula <- as.formula(
+  paste("relapse ~", paste(colnames(pc_df)[seq_len(n_pc)], collapse = " + "))
+)
+global_glm <- glm(pc_formula, data = pc_df, family = binomial())
+pc_anova <- as.data.frame(anova(global_glm, test = "Chisq")) %>%
+  rownames_to_column("term")
+
+save_csv(pc_anova, "adjuvant_mc_pca_logistic_anova.csv")
+
+cat("\n=== Global logistic regression on top", n_pc, "PCs ===\n")
+print(pc_anova)
+
+pc_plot_df <- pc_df %>%
+  mutate(relapse_status = adj_df$relapse_status)
+
+p_pca <- ggplot(pc_plot_df, aes(x = PC1, y = PC2, colour = relapse_status)) +
+  geom_point(size = 2.5, alpha = 0.8) +
+  stat_ellipse(linewidth = 0.7) +
+  scale_colour_manual(values = relapse_colours, name = NULL) +
+  labs(
+    title = "Metacluster composition (PCA)",
+    subtitle = "Adjuvant-treated patients coloured by relapse status",
+    x = paste0("PC1 (", round(100 * summary(pca)$importance[2, 1], 1), "% var)"),
+    y = paste0("PC2 (", round(100 * summary(pca)$importance[2, 2], 1), "% var)")
+  ) +
+  theme_classic(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+
+print(p_pca)
+save_plot(p_pca, "adjuvant_mc_pca_relapse.png", width = 7, height = 6)
+```
+
+```{r mc-volcano-plot}
+volcano_df <- mc_prob_stats %>%
+  filter(is.finite(delta_mean), is.finite(p_value), p_value > 0)
+
+p_mc_volcano <- ggplot(
+  volcano_df,
+  aes(x = delta_mean, y = -log10(p_value), colour = adj_p_value < 0.10)
+) +
+  geom_point(alpha = 0.75, size = 2) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey40") +
+  scale_colour_manual(
+    values = c("FALSE" = "grey60", "TRUE" = "#B2182B"),
+    name = "FDR < 0.10"
+  ) +
+  labs(
+    title = "Metacluster probability shift by relapse status",
+    subtitle = "Adjuvant-treated patients | Wilcoxon per metacluster",
+    x = "Mean difference (Relapse - No relapse)",
+    y = expression("-log"[10] * "(p-value)")
+  ) +
+  theme_bw(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"), legend.position = "bottom")
+
+if (requireNamespace("ggrepel", quietly = TRUE)) {
+  label_df <- volcano_df %>% arrange(p_value) %>% slice_head(n = 12)
+  p_mc_volcano <- p_mc_volcano +
+    ggrepel::geom_text_repel(
+      data = label_df,
+      aes(label = metacluster),
+      size = 3,
+      max.overlaps = Inf,
+      show.legend = FALSE,
+      colour = "black"
+    )
+}
+
+print(p_mc_volcano)
+save_plot(p_mc_volcano, "adjuvant_mc_relapse_volcano.png", width = 9, height = 6)
+```
+
+```{r mc-heatmap-top}
+top_n <- 20
+top_mc <- mc_prob_stats %>%
+  filter(is.finite(p_value)) %>%
+  arrange(p_value) %>%
+  slice_head(n = top_n) %>%
+  pull(column)
+
+if (length(top_mc) >= 2 && requireNamespace("pheatmap", quietly = TRUE)) {
+  hm_mat <- adj_df %>%
+    group_by(relapse_status) %>%
+    summarise(across(all_of(top_mc), ~ mean(.x, na.rm = TRUE)), .groups = "drop") %>%
+    column_to_rownames("relapse_status") %>%
+    t()
+
+  rownames(hm_mat) <- gsub("abundance_metacluster_leiden_1.0_", "", rownames(hm_mat))
+  hm_mat <- hm_mat[apply(hm_mat, 1, sd) > 0, , drop = FALSE]
+
+  draw_hm <- function() {
+    pheatmap(
+      hm_mat,
+      scale = "row",
+      cluster_cols = FALSE,
+      cluster_rows = TRUE,
+      border_color = NA,
+      color = colorRampPalette(c("#1B4332", "white", "#B2182B"))(100),
+      main = paste0("Top ", nrow(hm_mat), " metaclusters by Wilcoxon p-value"),
+      fontsize_row = 9
+    )
+  }
+
+  hm_png <- file.path(output_dir, "adjuvant_mc_relapse_heatmap.png")
+  hm_pdf <- file.path(output_dir, "adjuvant_mc_relapse_heatmap.pdf")
+  png(hm_png, width = 8, height = 9, units = "in", res = 300)
+  draw_hm()
+  dev.off()
+  pdf(hm_pdf, width = 8, height = 9)
+  draw_hm()
+  dev.off()
+  message("Saved: ", hm_png)
+}
+```
+
+```{r mc-boxplots-top}
+top_hits <- mc_prob_stats %>%
+  filter(is.finite(p_value)) %>%
+  arrange(p_value) %>%
+  slice_head(n = 6) %>%
+  pull(column)
+
+if (length(top_hits) > 0) {
+  long_box <- adj_df %>%
+    select(relapse_status, all_of(top_hits)) %>%
+    pivot_longer(-relapse_status, names_to = "column", values_to = "probability") %>%
+    left_join(
+      mc_prob_stats %>% select(column, metacluster, p_value, cor_rsf),
+      by = "column"
+    ) %>%
+    mutate(
+      label = paste0(metacluster, "\np=", signif(p_value, 2))
+    )
+
+  p_mc_box <- ggplot(long_box, aes(x = relapse_status, y = probability, fill = relapse_status)) +
+    geom_boxplot(outlier.shape = 21, alpha = 0.85) +
+    geom_jitter(width = 0.12, alpha = 0.35, size = 1) +
+    facet_wrap(~ label, scales = "free_y", ncol = 3) +
+    scale_fill_manual(values = relapse_colours) +
+    labs(
+      title = "Top metaclusters: probability by relapse status",
+      subtitle = "Adjuvant-treated patients only",
+      x = NULL,
+      y = "Metacluster probability"
+    ) +
+    theme_bw(base_size = 11) +
+    theme(
+      plot.title = element_text(face = "bold"),
+      legend.position = "none",
+      strip.text = element_text(size = 9)
+    )
+
+  print(p_mc_box)
+  save_plot(p_mc_box, "adjuvant_mc_relapse_top_boxplots.png", width = 10, height = 7)
+}
+```
+
+```{r mc-composite-boxplot}
+if ("bad_minus_good" %in% names(adj_df)) {
+  p_comp <- ggplot(adj_df, aes(x = relapse_status, y = bad_minus_good, fill = relapse_status)) +
+    geom_boxplot(alpha = 0.85, outlier.shape = 21) +
+    geom_jitter(width = 0.12, alpha = 0.35, size = 1.2) +
+    scale_fill_manual(values = relapse_colours) +
+    stat_compare_means(method = "wilcox.test", label = "p.format", size = 4) +
+    labs(
+      title = "Event-enriched minus no-event metacluster composite",
+      subtitle = "Adjuvant-treated patients by relapse status",
+      x = NULL,
+      y = "Bad MC sum - Good MC sum"
+    ) +
+    theme_classic(base_size = 12) +
+    theme(plot.title = element_text(face = "bold"), legend.position = "none")
+
+  print(p_comp)
+  save_plot(p_comp, "adjuvant_mc_bad_minus_good_boxplot.png")
+}
+```
+
+```{r summary}
+cat("\n=== Summary ===\n")
+cat("Output directory:", output_dir, "\n")
+cat("Adjuvant patients analysed:", nrow(adj_df), "\n")
+cat("  Low risk: ", sum(adj_df$risk_grp == "Low"), "\n")
+cat("  High risk:", sum(adj_df$risk_grp == "High"), "\n")
+cat("  Relapse:  ", sum(adj_df$dfs_event == 1), "\n")
+cat("\nRSF risk tests:\n")
+print(results_summary)
+if (exists("composite_results") && nrow(composite_results) > 0) {
+  cat("\nComposite metacluster tests:\n")
+  print(composite_results)
+}
+cat("\nFiles written to ", output_dir, ":\n", sep = "")
+print(list.files(output_dir))
+```

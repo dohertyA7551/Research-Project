@@ -1,0 +1,78 @@
+---
+title: "xCell combined enrichment after per-cell-type Anderson-Darling tests"
+output: html_notebook
+---
+
+Tests whether each xCell2 cell type's enrichment score **distribution** is similar **across the four cohorts** (Anderson-Darling k-sample test per cell type).
+
+This is **not** stratified by High/Low risk — it only asks whether Stage2, Retrospective, Colossus, and Taxonomy have comparable score distributions for each cell feature.
+
+If any cell types pass (AD p ≥ 0.05), those are pooled and High vs Low Wilcoxon, volcano, and top-5 tables are rerun on the passing subset only.
+
+**Outputs:** `analysis_output/combined/`
+
+```{r setup}
+library(dplyr)
+library(readr)
+source("analysis_helpers.R")
+source("xcell_combine_helpers.R")
+```
+
+```{r ad-test}
+if (dir.exists("analysis_output/combined")) {
+  base_dir <- "."
+} else if (dir.exists("Transcriptomics/analysis_output/combined")) {
+  base_dir <- "Transcriptomics"
+} else {
+  base_dir <- "."
+}
+output_dir <- file.path(base_dir, "analysis_output", "combined")
+
+out <- run_xcell_ad_and_combined(
+  output_dir = output_dir,
+  ad_alpha = 0.05
+)
+
+print(out$ad_out$results %>% arrange(ad_p) %>% head(15))
+cat("\nPassing:", length(out$passing_cell_types), "cell types\n")
+```
+
+```{r combined-results}
+if (out$can_combine && !is.null(out$diff_combined)) {
+  cat("\nCombined Wilcoxon (AD-passing cell types) — top hits:\n")
+  print(
+    out$diff_combined %>%
+      arrange(pval) %>%
+      select(cell_type, log2FC, pval) %>%
+      head(10)
+  )
+} else {
+  cat("\nNo cell types passed AD — review xcell_ad_by_cell_type.csv\n")
+}
+```
+
+```{r density-plots}
+density_dir <- file.path(output_dir, "density_plots")
+export_xcell_cohort_density_plots(
+  out$scores_long,
+  output_dir = density_dir,
+  n_cell_types = 12L,
+  z_score_within_cell_type = FALSE
+)
+export_xcell_cohort_density_plots(
+  out$scores_long,
+  output_dir = density_dir,
+  n_cell_types = 12L,
+  z_score_within_cell_type = TRUE
+)
+```
+
+```{r quantile-combined}
+qn_out <- run_xcell_quantile_combined_analysis(output_dir = output_dir)
+print(
+  qn_out$diff_combined %>%
+    arrange(pval) %>%
+    select(cell_type, log2FC, pval) %>%
+    head(10)
+)
+```

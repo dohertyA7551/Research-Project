@@ -1,0 +1,757 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+```{r}
+plot(cars)
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(readr)
+library(stringr)
+
+source("analysis_helpers.R")
+source("progeny_helpers.R")
+source("xcell_combine_helpers.R")
+
+MC_PREFIX <- "abundance_metacluster_leiden_1.0_"
+```
+
+
+
+
+```{r}
+mc_short_name <- function(col) {
+  sub(paste0("^", MC_PREFIX), "", col)
+}
+
+load_patient_metaclusters <- function(survival_df) {
+  mc_cols <- grep(paste0("^", MC_PREFIX), names(survival_df), value = TRUE)
+  if (length(mc_cols) == 0) {
+    stop("No metacluster abundance columns found in survival_df.")
+  }
+  survival_df %>%
+    dplyr::select(
+      dplyr::any_of(c("patient_id", "rsf_risk", "risk_grp")),
+      dplyr::all_of(mc_cols)
+    ) %>%
+    dplyr::distinct(.data$patient_id, .keep_all = TRUE)
+}
+
+spearman_mc_omics <- function(
+  combined_df, mc_cols, feature_cols, cohort, omics_type, min_n = 10L
+) {
+  rows <- list()
+  for (mc in mc_cols) {
+    mc_vals <- combined_df[[mc]]
+    for (feat in feature_cols) {
+      feat_vals <- combined_df[[feat]]
+      ok <- is.finite(mc_vals) & is.finite(feat_vals)
+      n <- sum(ok)
+      if (n < min_n) next
+      ct <- tryCatch(
+        stats::cor.test(mc_vals[ok], feat_vals[ok], method = "spearman", exact = FALSE),
+        error = function(e) NULL
+      )
+      if (is.null(ct)) next
+      rows[[length(rows) + 1L]] <- data.frame(
+        cohort = cohort, omics_type = omics_type,
+        metacluster = mc_short_name(mc), mc_column = mc,
+        feature = feat, rho = unname(ct$estimate), pval = ct$p.value, n = n,
+        stringsAsFactors = FALSE
+      )
+    }
+  }
+  if (length(rows) == 0) return(tibble::tibble())
+  dplyr::bind_rows(rows)
+}
+
+fisher_meta_mc_omics <- function(cohort_results, min_cohorts = 2L) {
+  if (length(cohort_results) < min_cohorts) {
+    stop("Fisher meta requires at least ", min_cohorts, " cohort result tables.")
+  }
+  all <- dplyr::bind_rows(cohort_results)
+  keys <- all %>% dplyr::distinct(.data$omics_type, .data$metacluster, .data$feature)
+
+  meta_rows <- lapply(seq_len(nrow(keys)), function(i) {
+    row <- keys[i, , drop = FALSE]
+    sub <- all %>%
+      dplyr::filter(
+        .data$omics_type == row$omics_type,
+        .data$metacluster == row$metacluster,
+        .data$feature == row$feature
+      )
+    pvals <- sub$pval[is.finite(sub$pval)]
+    rhos <- sub$rho[is.finite(sub$rho)]
+    n_cohorts <- length(pvals)
+    fisher_p <- if (n_cohorts >= min_cohorts) {
+      stats::pchisq(-2 * sum(log(pvals)), df = 2 * n_cohorts, lower.tail = FALSE)
+    } else NA_real_
+    mean_rho <- mean(rhos, na.rm = TRUE)
+    sign_agree <- if (length(rhos) >= 2L) {
+      sum(rhos > 0) == length(rhos) || sum(rhos < 0) == length(rhos)
+    } else NA
+    out <- data.frame(
+      omics_type = row$omics_type, metacluster = row$metacluster, feature = row$feature,
+      fisher_p = fisher_p, fisher_padj = NA_real_, n_cohorts = n_cohorts,
+      mean_rho = mean_rho, sign_consistent = sign_agree, stringsAsFactors = FALSE
+    )
+    for (cn in unique(sub$cohort)) {
+      cs <- sub[sub$cohort == cn, , drop = FALSE]
+      out[[paste0("rho_", cn)]] <- cs$rho[1]
+      out[[paste0("pval_", cn)]] <- cs$pval[1]
+      out[[paste0("n_", cn)]] <- cs$n[1]
+    }
+    out
+  })
+  meta <- dplyr::bind_rows(meta_rows)
+  ok_fisher <- is.finite(meta$fisher_p)
+  meta$fisher_padj[ok_fisher] <- stats::p.adjust(meta$fisher_p[ok_fisher], method = "BH")
+  meta[order(meta$fisher_padj, meta$fisher_p, na.last = TRUE), , drop = FALSE]
+}
+```
+```{r}
+data_dir <- "/work_space/files/Transcriptomics/analysis_output/metacluster_correlation"
+```
+
+
+```{r}
+aggregate_omics_to_patient <- function(
+  scores_long, patient_col = "patient_id", feature_col,
+  value_col = "score", sample_col = "sample_id"
+) {
+  if (!patient_col %in% names(scores_long)) {
+    stop("Column not found: ", patient_col)
+  }
+  scores_long %>%
+    dplyr::filter(!is.na(.data[[patient_col]])) %>%
+    dplyr::group_by(.data[[patient_col]], .data[[feature_col]]) %>%
+    dplyr::summarise(
+      value = mean(.data[[value_col]], na.rm = TRUE),
+      n_samples = dplyr::n(),
+      .groups = "drop"
+    ) %>%
+    tidyr::pivot_wider(names_from = .data[[feature_col]], values_from = value) %>%
+    tibble::column_to_rownames(patient_col) %>%
+    as.data.frame(check.names = FALSE)
+}
+
+run_progeny_cohort_patient_wide <- function(expr_mat, sample_meta) {
+  sample_meta <- sample_meta %>%
+    dplyr::filter(!is.na(.data$patient_id), .data$sample_id %in% colnames(expr_mat))
+  if (nrow(sample_meta) < 3L) return(NULL)
+  expr <- expr_mat[, sample_meta$sample_id, drop = FALSE]
+  progeny <- run_progeny_mlm(expr)
+  acts_long <- progeny_activities_to_long(progeny$activities, sample_meta)
+  aggregate_omics_to_patient(
+    acts_long, patient_col = "patient_id", feature_col = "pathway",
+    value_col = "score", sample_col = "sample_id"
+  )
+}
+
+join_mc_with_omics <- function(mc_df, omics_patient_wide) {
+  common <- intersect(mc_df$patient_id, rownames(omics_patient_wide))
+  if (length(common) == 0L) {
+    stop("No overlapping patients between metaclusters and omics scores.")
+  }
+  mc_sub <- mc_df %>%
+    dplyr::filter(.data$patient_id %in% common) %>%
+    tibble::column_to_rownames("patient_id") %>%
+    as.data.frame(check.names = FALSE)
+  omics_sub <- omics_patient_wide[common, , drop = FALSE]
+  cbind(mc_sub, omics_sub)
+}
+```
+```{r}
+p <- resolve_progeny_paths()
+survival_path <- file.path(p$proteomics, "survival_df_with_risk.rds")
+survival_df <- readRDS(survival_path)
+mc_df <- load_patient_metaclusters(survival_df)
+mc_cols <- grep(paste0("^", MC_PREFIX), names(mc_df), value = TRUE)
+
+cohort_loaders <- list(
+  Stage2        = function() load_stage2_expression_meta(p, survival_df),
+  Retrospective = function() load_retrospective_expression_meta(p, survival_df),
+  Colossus      = function() load_colossus_expression_meta(p, survival_df),
+  Taxonomy      = function() load_taxonomy_expression_meta(p, survival_path)
+)
+
+combined_by_cohort <- list()
+for (cn in names(cohort_loaders)) {
+  message("Building combined data: ", cn)
+  dat <- cohort_loaders[[cn]]()
+  omics_wide <- run_progeny_cohort_patient_wide(dat$expr, dat$meta)
+  if (is.null(omics_wide) || ncol(omics_wide) == 0) {
+    warning("Skipping ", cn, " (no patient-level PROGENy scores).")
+    next
+  }
+  combined <- join_mc_with_omics(mc_df, omics_wide)
+  combined_by_cohort[[cn]] <- combined
+  message("  ", cn, ": ", nrow(combined), " patients, ", ncol(combined), " columns")
+}
+
+names(combined_by_cohort)
+sapply(combined_by_cohort, nrow)
+```
+```{r}
+wilcox_mc_presence_omics <- function(
+  combined_df, mc_col, feature_cols, cohort, omics_type, min_n_per_group = 3L
+) {
+  mc_vals <- combined_df[[mc_col]]
+  present <- mc_vals > 0
+
+  rows <- list()
+  for (feat in feature_cols) {
+    feat_vals <- combined_df[[feat]]
+    ok <- is.finite(feat_vals) & !is.na(present)
+    n_present <- sum(present[ok])
+    n_absent  <- sum(!present[ok])
+    if (n_present < min_n_per_group || n_absent < min_n_per_group) next
+
+    x_present <- feat_vals[ok & present]
+    x_absent  <- feat_vals[ok & !present]
+    wt <- tryCatch(wilcox.test(x_present, x_absent, exact = FALSE), error = function(e) NULL)
+    if (is.null(wt)) next
+
+    U <- wt$statistic
+    n1 <- length(x_present); n2 <- length(x_absent)
+    r_rb <- 1 - (2 * U) / (n1 * n2)
+
+    rows[[length(rows) + 1L]] <- data.frame(
+      cohort = cohort, omics_type = omics_type, metacluster = "MC_47",
+      feature = feat, median_present = median(x_present, na.rm = TRUE),
+      median_absent = median(x_absent, na.rm = TRUE),
+      rho = r_rb, pval = wt$p.value,
+      n_present = n1, n_absent = n2, n = n1 + n2,
+      stringsAsFactors = FALSE
+    )
+  }
+  if (length(rows) == 0) return(tibble::tibble())
+  dplyr::bind_rows(rows)
+}
+
+mc47_col <- "abundance_metacluster_leiden_1.0_MC_47"
+pathway_cols <- c("Androgen","EGFR","Estrogen","Hypoxia","JAK-STAT","MAPK",
+                   "NFkB","PI3K","TGFb","TNFa","Trail","VEGF","WNT","p53")
+
+mc47_cohort_results <- lapply(names(combined_by_cohort), function(cn) {
+  wilcox_mc_presence_omics(
+    combined_by_cohort[[cn]], mc_col = mc47_col,
+    feature_cols = intersect(pathway_cols, colnames(combined_by_cohort[[cn]])),
+    cohort = cn, omics_type = "PROGENy"
+  )
+})
+names(mc47_cohort_results) <- names(combined_by_cohort)
+mc47_cohort_results <- Filter(function(x) nrow(x) > 0, mc47_cohort_results)
+
+mc47_meta <- fisher_meta_mc_omics(mc47_cohort_results, min_cohorts = 2L) %>%
+  dplyr::arrange(fisher_padj)
+
+readr::write_csv(mc47_meta, "MC47_presence_absence_progeny_fisher_meta.csv")
+mc47_meta
+```
+```{r}
+top10 <- c("MC_0", "MC_47", "MC_30", "MC_7", "MC_5",
+           "MC_10", "MC_13", "MC_17", "MC_8", "MC_6")
+
+progeny_files <- list(
+  Stage2        = file.path(data_dir, "Stage2_mc_progeny_spearman.csv"),
+  Retrospective = file.path(data_dir, "Retrospective_mc_progeny_spearman.csv"),
+  Colossus      = file.path(data_dir, "Colossus_mc_progeny_spearman.csv"),
+  Taxonomy      = file.path(data_dir, "Taxonomy_mc_progeny_spearman.csv")
+)
+
+progeny_cohort_results <- lapply(progeny_files, function(f) {
+  d <- readr::read_csv(f, show_col_types = FALSE)
+  d <- d[d$feature != "n_samples", ]
+  d[d$metacluster %in% top10, ]
+})
+
+top10_progeny_meta <- fisher_meta_mc_omics(progeny_cohort_results, min_cohorts = 2L) %>%
+  dplyr::arrange(fisher_padj)
+
+readr::write_csv(top10_progeny_meta, "top10_vimp_progeny_fisher_meta.csv")
+
+top10_progeny_sig <- top10_progeny_meta
+```
+```{r}
+
+cat("Total MC x pathway pairs tested:", nrow(top10_progeny_meta), "\n")
+cat("Significant at FDR 0.05:", sum(top10_progeny_meta$fisher_padj <= 0.05, na.rm = TRUE), "\n")
+cat("...and directionally consistent across cohorts:", nrow(top10_progeny_sig), "\n\n")
+print(top10_progeny_sig %>% dplyr::select(metacluster, feature, mean_rho, fisher_padj, n_cohorts))
+```
+```{r}
+aggregate_omics_to_patient <- function(
+  scores_long, patient_col = "patient_id", feature_col,
+  value_col = "score", sample_col = "sample_id"
+) {
+  if (!patient_col %in% names(scores_long)) {
+    stop("Column not found: ", patient_col)
+  }
+  scores_long %>%
+    dplyr::filter(!is.na(.data[[patient_col]])) %>%
+    dplyr::group_by(.data[[patient_col]], .data[[feature_col]]) %>%
+    dplyr::summarise(
+      value = mean(.data[[value_col]], na.rm = TRUE),
+      n_samples = dplyr::n(),
+      .groups = "drop"
+    ) %>%
+    tidyr::pivot_wider(names_from = .data[[feature_col]], values_from = value) %>%
+    tibble::column_to_rownames(patient_col) %>%
+    as.data.frame(check.names = FALSE)
+}
+
+run_progeny_cohort_patient_wide <- function(expr_mat, sample_meta) {
+  sample_meta <- sample_meta %>%
+    dplyr::filter(!is.na(.data$patient_id), .data$sample_id %in% colnames(expr_mat))
+  if (nrow(sample_meta) < 3L) return(NULL)
+  expr <- expr_mat[, sample_meta$sample_id, drop = FALSE]
+  progeny <- run_progeny_mlm(expr)
+  acts_long <- progeny_activities_to_long(progeny$activities, sample_meta)
+  aggregate_omics_to_patient(
+    acts_long, patient_col = "patient_id", feature_col = "pathway",
+    value_col = "score", sample_col = "sample_id"
+  )
+}
+
+xcell_long_to_patient_wide <- function(scores_long) {
+  aggregate_omics_to_patient(
+    scores_long, patient_col = "patient_id", feature_col = "cell_type",
+    value_col = "enrichment", sample_col = "sample"
+  )
+}
+
+join_mc_with_omics <- function(mc_df, omics_patient_wide) {
+  common <- intersect(mc_df$patient_id, rownames(omics_patient_wide))
+  if (length(common) == 0L) {
+    stop("No overlapping patients between metaclusters and omics scores.")
+  }
+  mc_sub <- mc_df %>%
+    dplyr::filter(.data$patient_id %in% common) %>%
+    tibble::column_to_rownames("patient_id") %>%
+    as.data.frame(check.names = FALSE)
+  omics_sub <- omics_patient_wide[common, , drop = FALSE]
+  cbind(mc_sub, omics_sub)
+}
+```
+```{r}
+library(decoupleR)
+progeny_net <- decoupleR::get_progeny(organism = "human", top = 500)
+print(unique(progeny_net$source))
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(readr)
+
+df <- read_csv("top10_vimp_progeny_fisher_meta.csv", show_col_types = FALSE)
+
+# --- Risk grouping, based on RSF clinical risk score correlation ---
+LOW_RISK  <- c("MC_13", "MC_7", "MC_30", "MC_6", "MC_17")
+HIGH_RISK <- c("MC_0", "MC_5", "MC_10", "MC_47")
+# MC_8 not present in the RSF-risk plot -> marked Unclassified
+
+df <- df %>%
+  mutate(
+    risk_group = case_when(
+      metacluster %in% HIGH_RISK ~ "High-risk",
+      metacluster %in% LOW_RISK  ~ "Low-risk",
+      TRUE ~ "Unclassified"
+    ),
+    risk_group = factor(risk_group, levels = c("Low-risk", "High-risk", "Unclassified")),
+    sig_label = ifelse(!is.na(fisher_padj) & fisher_padj <= 0.05, "*", "")
+  )
+
+# Order metaclusters: low-risk block, then high-risk block, then unclassified
+mc_order <- c(LOW_RISK, HIGH_RISK, setdiff(unique(df$metacluster), c(LOW_RISK, HIGH_RISK)))
+df$metacluster <- factor(df$metacluster, levels = rev(mc_order))  # rev so low-risk appears at top
+
+p <- ggplot(df, aes(x = feature, y = metacluster, fill = mean_rho)) +
+  geom_tile(color = "white", linewidth = 0.6) +
+  geom_text(aes(label = sig_label), color = "black", fontface = "bold", size = 5, vjust = 0.75) +
+  scale_fill_gradient2(
+    low = "#B03A2E", mid = "white", high = "#2E7D32",
+    midpoint = 0, name = "Mean\nSpearman ρ",
+    limits = c(-max(abs(df$mean_rho)), max(abs(df$mean_rho)))
+  ) +
+  labs(
+    title = "Metacluster–PROGENy Pathway Associations",
+    subtitle = "Grouped by RSF risk group; * = FDR-adjusted p \u2264 0.05",
+    x = NULL, y = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank(),
+    plot.title = element_text(face = "bold", size = 13),
+    plot.subtitle = element_text(size = 10, color = "grey30")
+  )
+
+# Add separating lines between risk-group blocks
+n_low  <- length(LOW_RISK)
+n_high <- length(HIGH_RISK)
+n_total <- length(mc_order)
+
+p <- p +
+  geom_hline(yintercept = n_total - n_low + 0.5, linewidth = 1) +
+  geom_hline(yintercept = n_total - n_low - n_high + 0.5, linewidth = 1, linetype = "dashed")
+
+p
+
+ggsave("mc_progeny_heatmap.png", plot = p, width = 9, height = 6, dpi = 300, bg = "white")
+```
+```{r}
+# Reload your survival_df / patient metacluster data
+mc_df <-merged_df
+mc_col <- "abundance_metacluster_leiden_1.0_MC_47"
+
+summary(mc_df[[mc_col]])
+sd(mc_df[[mc_col]], na.rm = TRUE)
+table(mc_df[[mc_col]] == 0)  # how many patients have exactly zero abundance
+hist(mc_df[[mc_col]], main = "MC_47 abundance distribution")
+```
+
+
+
+```{r}
+library(dplyr)
+library(readr)
+
+# ---------------------------------------------------------
+# Rebuild combined_by_cohort from scratch
+# (mirrors what run_metacluster_progeny_xcell_correlation()
+#  does internally, but stops after the join step so we can
+#  reuse the combined data frames directly)
+# ---------------------------------------------------------
+
+p <- resolve_progeny_paths()
+
+survival_path <- file.path(p$proteomics, "survival_df_with_risk.rds")
+survival_df <- readRDS(survival_path)
+
+mc_df <- load_patient_metaclusters(survival_df)
+mc_cols <- grep(paste0("^", MC_PREFIX), names(mc_df), value = TRUE)
+
+cohort_loaders <- list(
+  Stage2        = function() load_stage2_expression_meta(p, survival_df),
+  Retrospective = function() load_retrospective_expression_meta(p, survival_df),
+  Colossus      = function() load_colossus_expression_meta(p, survival_df),
+  Taxonomy      = function() load_taxonomy_expression_meta(p, survival_path)
+)
+
+combined_by_cohort <- list()
+
+for (cn in names(cohort_loaders)) {
+  message("Building combined data: ", cn)
+
+  dat <- cohort_loaders[[cn]]()
+  omics_wide <- run_progeny_cohort_patient_wide(dat$expr, dat$meta)
+
+  if (is.null(omics_wide) || ncol(omics_wide) == 0) {
+    warning("Skipping ", cn, " (no patient-level PROGENy scores).")
+    next
+  }
+
+  combined <- join_mc_with_omics(mc_df, omics_wide)
+  combined_by_cohort[[cn]] <- combined
+
+  message("  ", cn, ": ", nrow(combined), " patients, ",
+          ncol(combined), " columns")
+}
+
+# Quick check
+names(combined_by_cohort)
+sapply(combined_by_cohort, nrow)
+```
+
+```{r}
+
+library(decoupleR)
+library(igraph)
+library(dplyr)
+library(tidyr)
+library(readr)
+
+GREEN <- "#2E7D32"
+RED   <- "#B03A2E"
+
+pathways_of_interest <- c("JAK-STAT", "NFkB", "PI3K", "WNT", "p53")
+
+# ---------------------------------------------------------
+# 1. Get PROGENy footprint genes (top N by weight per pathway)
+# ---------------------------------------------------------
+
+progeny_net <- decoupleR::get_progeny(organism = "human", top = 500)
+
+top_genes_per_pathway <- progeny_net %>%
+  filter(source %in% pathways_of_interest) %>%
+  group_by(source) %>%
+  slice_max(abs(weight), n = 12) %>%
+  ungroup()
+
+all_genes <- unique(top_genes_per_pathway$target)
+cat("Total unique genes across 5 pathways:", length(all_genes), "\n")
+
+# ---------------------------------------------------------
+# 2. Pull real protein-protein interactions among these genes (STRINGdb)
+# ---------------------------------------------------------
+
+if (!requireNamespace("STRINGdb", quietly = TRUE)) {
+  BiocManager::install("STRINGdb")
+}
+library(STRINGdb)
+
+string_db <- STRINGdb$new(version = "12.0", species = 9606, score_threshold = 400)
+
+mapped <- string_db$map(data.frame(gene = all_genes), "gene", removeUnmappedRows = TRUE)
+
+string_edges <- string_db$get_interactions(mapped$STRING_id)
+
+id_to_symbol <- setNames(mapped$gene, mapped$STRING_id)
+ppi_sub <- string_edges %>%
+  mutate(
+    source_genesymbol = id_to_symbol[from],
+    target_genesymbol = id_to_symbol[to]
+  ) %>%
+  filter(!is.na(source_genesymbol), !is.na(target_genesymbol))
+
+cat("Edges found among footprint genes:", nrow(ppi_sub), "\n")
+
+# ---------------------------------------------------------
+# 3. Pull group-mean correlation strength per pathway
+# ---------------------------------------------------------
+
+LOW_RISK  <- c("MC_13", "MC_7", "MC_30", "MC_6", "MC_17")
+HIGH_RISK <- c("MC_0", "MC_5", "MC_10", "MC_47")
+
+meta <- read_csv("top10_vimp_progeny_fisher_meta.csv", show_col_types = FALSE) %>%
+  mutate(
+    risk_group = case_when(
+      metacluster %in% HIGH_RISK ~ "High-risk",
+      metacluster %in% LOW_RISK  ~ "Low-risk",
+      TRUE ~ "Unclassified"
+    )
+  ) %>%
+  filter(risk_group %in% c("Low-risk", "High-risk"))
+
+group_rho <- meta %>%
+  filter(feature %in% pathways_of_interest) %>%
+  group_by(feature, risk_group) %>%
+  summarise(mean_rho = mean(mean_rho, na.rm = TRUE), .groups = "drop")
+
+# ---------------------------------------------------------
+# 4. Network-building function (base igraph, no ggraph needed)
+# ---------------------------------------------------------
+
+build_pathway_network_base <- function(pathway_name, node_color, rho_value) {
+  genes <- top_genes_per_pathway %>%
+    filter(source == pathway_name) %>%
+    pull(target)
+
+  edges <- ppi_sub %>%
+    filter(source_genesymbol %in% genes, target_genesymbol %in% genes)
+
+  g <- igraph::graph_from_data_frame(
+    d = if (nrow(edges) > 0) edges %>% select(source_genesymbol, target_genesymbol) else
+      data.frame(source_genesymbol = character(0), target_genesymbol = character(0)),
+    vertices = data.frame(name = genes),
+    directed = FALSE
+  )
+
+  rho_label <- if (is.na(rho_value)) "NA" else sprintf("%.2f", rho_value)
+
+  plot(
+    g,
+    vertex.color = node_color,
+    vertex.size = 20,
+    vertex.label.cex = 0.65,
+    vertex.label.color = "black",
+    vertex.frame.color = "black",
+    edge.color = "grey70",
+    layout = layout_with_fr(g),
+    main = paste0(pathway_name, " (\u03c1 = ", rho_label, ")")
+  )
+}
+
+# ---------------------------------------------------------
+# 5. Filter to only pathways UP (positive mean rho) in each group
+# ---------------------------------------------------------
+
+low_risk_up <- group_rho %>%
+  filter(risk_group == "Low-risk", mean_rho > 0) %>%
+  pull(feature)
+
+high_risk_up <- group_rho %>%
+  filter(risk_group == "High-risk", mean_rho > 0) %>%
+  pull(feature)
+
+cat("Low-risk pathways (up):", paste(low_risk_up, collapse = ", "), "\n")
+cat("High-risk pathways (up):", paste(high_risk_up, collapse = ", "), "\n")
+
+# ---------------------------------------------------------
+# 6. Build the two figures
+# ---------------------------------------------------------
+
+n_low <- length(low_risk_up)
+if (n_low > 0) {
+  png("pathway_networks_low_risk.png", width = 480 * n_low, height = 550, res = 150)
+  par(mfrow = c(1, n_low), mar = c(1, 1, 3, 1))
+  for (p in low_risk_up) {
+    rho_val <- group_rho %>% filter(feature == p, risk_group == "Low-risk") %>% pull(mean_rho)
+    build_pathway_network_base(p, GREEN, rho_val[1])
+  }
+  mtext("Low-Risk Metacluster Pathway Networks", outer = TRUE, line = -1.5, cex = 1.2, font = 2)
+  dev.off()
+} else {
+  message("No pathways with positive mean rho in Low-risk group.")
+}
+
+n_high <- length(high_risk_up)
+if (n_high > 0) {
+  png("pathway_networks_high_risk.png", width = 480 * n_high, height = 550, res = 150)
+  par(mfrow = c(1, n_high), mar = c(1, 1, 3, 1))
+  for (p in high_risk_up) {
+    rho_val <- group_rho %>% filter(feature == p, risk_group == "High-risk") %>% pull(mean_rho)
+    build_pathway_network_base(p, RED, rho_val[1])
+  }
+  mtext("High-Risk Metacluster Pathway Networks", outer = TRUE, line = -1.5, cex = 1.2, font = 2)
+  dev.off()
+} else {
+  message("No pathways with positive mean rho in High-risk group.")
+}
+
+cat("Saved: pathway_networks_low_risk.png and pathway_networks_high_risk.png (where applicable)\n")
+
+```
+```{r}
+library(pheatmap)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(readr)
+
+LOW_RISK  <- c("MC_13", "MC_7")
+HIGH_RISK <- c("MC_0", "MC_5")
+
+
+df <- read_csv("top10_vimp_progeny_fisher_meta.csv", show_col_types = FALSE) %>%
+  mutate(
+    risk_group = case_when(
+      metacluster %in% HIGH_RISK ~ "High-risk",
+      metacluster %in% LOW_RISK  ~ "Low-risk",
+      TRUE ~ "Unclassified"
+    )
+  )
+
+# ---------------------------------------------------------
+# Find pathways where low-risk and high-risk group means
+# have OPPOSITE signs (i.e. genuinely diverge in direction)
+# ---------------------------------------------------------
+
+group_means <- df %>%
+  filter(risk_group %in% c("Low-risk", "High-risk")) %>%
+  group_by(feature, risk_group) %>%
+  summarise(mean_rho = mean(mean_rho, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = risk_group, values_from = mean_rho)
+
+opposite_pathways <- group_means %>%
+  filter(
+    !is.na(`Low-risk`), !is.na(`High-risk`),
+    sign(`Low-risk`) != sign(`High-risk`),
+    `Low-risk` != 0, `High-risk` != 0
+  ) %>%
+  pull(feature)
+
+cat("Pathways with opposite direction between risk groups:\n")
+print(opposite_pathways)
+
+# ---------------------------------------------------------
+# Build matrices, restricted to only those diverging pathways
+# ---------------------------------------------------------
+
+build_risk_matrix <- function(df, risk_mcs, pathway_filter) {
+  sub <- df %>%
+    filter(metacluster %in% risk_mcs, feature %in% pathway_filter) %>%
+    select(metacluster, feature, mean_rho) %>%
+    pivot_wider(names_from = feature, values_from = mean_rho) %>%
+    column_to_rownames("metacluster") %>%
+    as.matrix()
+  
+  sub <- sub[rowSums(!is.na(sub)) > 0, , drop = FALSE]
+  sub
+}
+
+low_risk_mat  <- build_risk_matrix(df, LOW_RISK, opposite_pathways)
+high_risk_mat <- build_risk_matrix(df, HIGH_RISK, opposite_pathways)
+
+# ---------------------------------------------------------
+# Shared pathway (column) order
+# ---------------------------------------------------------
+
+combined_mat <- rbind(low_risk_mat, high_risk_mat)
+col_cor <- cor(combined_mat, use = "pairwise.complete.obs")
+col_dist <- as.dist(1 - col_cor)
+col_clust <- hclust(col_dist, method = "complete")
+shared_pathway_order <- colnames(combined_mat)[col_clust$order]
+
+low_risk_mat  <- low_risk_mat[, shared_pathway_order, drop = FALSE]
+high_risk_mat <- high_risk_mat[, shared_pathway_order, drop = FALSE]
+
+# ---------------------------------------------------------
+# Shared diverging color scale
+# ---------------------------------------------------------
+
+max_abs <- max(abs(c(low_risk_mat, high_risk_mat)), na.rm = TRUE)
+breaks <- seq(-max_abs, max_abs, length.out = 101)
+diverging_colors <- colorRampPalette(c("#2166AC", "white", "#B2182B"))(100)
+
+# ---------------------------------------------------------
+# Heatmaps
+# ---------------------------------------------------------
+
+pheatmap(
+  low_risk_mat,
+  color = diverging_colors,
+  breaks = breaks,
+  display_numbers = TRUE,
+  number_format = "%.2f",
+  fontsize_number = 9,
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  clustering_method = "complete",
+  na_col = "grey90",
+  main = "Low-Risk Metaclusters\nPathways diverging from High-risk group",
+  filename = "low_risk_mc_pathway_heatmap.png",
+  width = 7, height = 5
+)
+
+pheatmap(
+  high_risk_mat,
+  color = diverging_colors,
+  breaks = breaks,
+  display_numbers = TRUE,
+  number_format = "%.2f",
+  fontsize_number = 9,
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  clustering_method = "complete",
+  na_col = "grey90",
+  main = "High-Risk Metaclusters\nPathways diverging from Low-risk group",
+  filename = "high_risk_mc_pathway_heatmap.png",
+  width = 7, height = 5
+)
+
+cat("Saved: low_risk_mc_pathway_heatmap.png and high_risk_mc_pathway_heatmap.png\n")
+```
+

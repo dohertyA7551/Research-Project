@@ -1,0 +1,334 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+```{r}
+plot(cars)
+```
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Ctrl+Alt+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Ctrl+Shift+K* to preview the HTML file).
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(survival)
+library(coxphf)
+library(purrr)
+library(glmnet)
+library(readr)
+library(broom)
+library(survminer)
+library(stringr)
+library(tidyr)
+library(tibble)
+library(umap)
+library(knitr)
+library(limma)
+```
+
+
+```{r}
+mc_cols <- grep("^abundance_metacluster_leiden_1\\.0_MC_[0-9]+$", 
+                 colnames(merged_df), value = TRUE)
+mc_cols
+mc_labels <- sub(".*_MC_([0-9]+)$", "MC_\\1", mc_cols)
+
+top_mc <- c("abundance_metacluster_leiden_1.0_MC_0",
+            "abundance_metacluster_leiden_1.0_MC_47",
+            "abundance_metacluster_leiden_1.0_MC_30",
+            "abundance_metacluster_leiden_1.0_MC_7",
+            "abundance_metacluster_leiden_1.0_MC_5",
+            "abundance_metacluster_leiden_1.0_MC_10",
+            "abundance_metacluster_leiden_1.0_MC_13",
+            "abundance_metacluster_leiden_1.0_MC_17",
+            "abundance_metacluster_leiden_1.0_MC_8",
+            "abundance_metacluster_leiden_1.0_MC_6",
+            "abundance_metacluster_leiden_1.0_MC_14",
+            "abundance_metacluster_leiden_1.0_MC_38",
+            "abundance_metacluster_leiden_1.0_MC_85")
+
+merged_df$site <- ifelse(merged_df$cancer_type == "COAD", "colon",
+                    ifelse(merged_df$cancer_type == "READ", "rectal", NA))
+table(merged_df$site, useNA = "always")
+```
+
+
+```{r}
+####looking at differences in mc abundance between sites
+merged_df$treatment_status <- ifelse(
+  merged_df$has_adjuvant_chemotherapy == "yes" | merged_df$has_neoadjuvant_chemoradiotherapy == "yes",
+  "Treated", "Untreated"
+)
+
+table(merged_df$treatment_status, useNA = "always")
+```
+```{r}
+tx_results <- lapply(top_mc, function(mc) {
+  test <- wilcox.test(merged_df[[mc]] ~ merged_df$treatment_status)
+  data.frame(metacluster = mc, p.value = test$p.value)
+}) |> dplyr::bind_rows() |>
+  dplyr::mutate(FDR = p.adjust(p.value, method = "BH")) |>
+  dplyr::arrange(FDR)
+
+tx_results
+```
+```{r}
+site_results <- lapply(mc_cols, function(mc) {
+  test <- wilcox.test(merged_df[[mc]] ~ merged_df$site)
+  data.frame(metacluster = mc, p.value = test$p.value)
+}) |> dplyr::bind_rows() |>
+  dplyr::mutate(FDR = p.adjust(p.value, method = "BH")) |>
+  dplyr::arrange(FDR)
+
+site_results
+
+
+site_results |> arrange(p.value) |> head(5)
+tx_results |> arrange(p.value) |> head(5)
+```
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# Define risk group membership per metacluster
+risk_group_map <- c(
+  "MC_13" = "Low-risk", "MC_17" = "Low-risk",
+  "MC_8" = "High-risk", "MC_0" = "High-risk", "MC_1" = "High-risk"
+)
+
+# --- SITE plot ---
+site_plot_df <- merged_df |>
+  select(site, all_of(top_mc)) |>
+  pivot_longer(cols = all_of(top_mc), names_to = "metacluster", values_to = "abundance") |>
+  mutate(mc_label = sub(".*_MC_([0-9]+)$", "MC_\\1", metacluster)) |>
+  filter(mc_label %in% names(risk_group_map)) |>
+  mutate(risk_group = risk_group_map[mc_label]) |>
+  filter(!is.na(site)) |>
+  group_by(site, mc_label, risk_group) |>
+  summarise(mean_abund = mean(abundance, na.rm = TRUE),
+            se = sd(abundance, na.rm = TRUE) / sqrt(n()),
+            .groups = "drop")
+
+ggplot(site_plot_df, aes(x = mc_label, y = mean_abund, fill = risk_group)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7, color = "black") +
+  geom_errorbar(aes(ymin = mean_abund - se, ymax = mean_abund + se),
+                position = position_dodge(width = 0.8), width = 0.2) +
+  facet_wrap(~ site) +
+  scale_fill_manual(values = c("Low-risk" = "#1B5E20", "High-risk" = "#B22222")) +
+  labs(title = "Metacluster abundance by tumour site",
+       x = "Metacluster", y = "Mean abundance", fill = "Risk group") +
+  theme_minimal(base_size = 13) +
+  theme(panel.grid.minor = element_blank(),
+        axis.line = element_line(color = "black"),
+        panel.border = element_blank(),
+        strip.background = element_blank())
+
+ggsave("site_metacluster_barplot.png", dpi = 300, width = 8, height = 5)
+
+# --- TREATMENT plot ---
+tx_plot_df <- merged_df |>
+  select(treatment_status, all_of(top_mc)) |>
+  pivot_longer(cols = all_of(top_mc), names_to = "metacluster", values_to = "abundance") |>
+  mutate(mc_label = sub(".*_MC_([0-9]+)$", "MC_\\1", metacluster)) |>
+  filter(mc_label %in% names(risk_group_map)) |>
+  mutate(risk_group = risk_group_map[mc_label]) |>
+  filter(!is.na(treatment_status)) |>
+  group_by(treatment_status, mc_label, risk_group) |>
+  summarise(mean_abund = mean(abundance, na.rm = TRUE),
+            se = sd(abundance, na.rm = TRUE) / sqrt(n()),
+            .groups = "drop")
+
+ggplot(tx_plot_df, aes(x = mc_label, y = mean_abund, fill = risk_group)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7, color = "black") +
+  geom_errorbar(aes(ymin = mean_abund - se, ymax = mean_abund + se),
+                position = position_dodge(width = 0.8), width = 0.2) +
+  facet_wrap(~ treatment_status) +
+  scale_fill_manual(values = c("Low-risk" = "#1B5E20", "High-risk" = "#B22222")) +
+  labs(title = "Metacluster abundance by treatment status",
+       x = "Metacluster", y = "Mean abundance", fill = "Risk group") +
+  theme_minimal(base_size = 13) +
+  theme(panel.grid.minor = element_blank(),
+        axis.line = element_line(color = "black"),
+        panel.border = element_blank(),
+        strip.background = element_blank())
+
+ggsave("treatment_metacluster_barplot.png", dpi = 300, width = 8, height = 5)
+```
+```{r}
+site_plot_df <- merged_df |>
+  select(site, all_of(top_mc)) |>
+  pivot_longer(cols = all_of(top_mc), names_to = "metacluster", values_to = "abundance") |>
+  mutate(mc_label = sub(".*_MC_([0-9]+)$", "MC_\\1", metacluster)) |>
+  filter(mc_label %in% names(risk_group_map), !is.na(site)) |>
+  mutate(risk_group = risk_group_map[mc_label],
+         mc_label = factor(mc_label, levels = c("MC_13", "MC_7", "MC_30", "MC_0", "MC_5", "MC_47")),
+         group_combo = paste(risk_group, site, sep = " - ")) |>
+  group_by(site, mc_label, risk_group, group_combo) |>
+  summarise(mean_abund = mean(abundance, na.rm = TRUE),
+            se = sd(abundance, na.rm = TRUE) / sqrt(n()),
+            .groups = "drop")
+
+ggplot(site_plot_df, aes(x = mc_label, y = mean_abund, fill = group_combo)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7, color = "black") +
+  geom_errorbar(aes(ymin = mean_abund - se, ymax = mean_abund + se),
+                position = position_dodge(width = 0.8), width = 0.2) +
+  scale_fill_manual(values = c(
+    "Low-risk - colon"   = "#1B5E20",  # dark green
+    "Low-risk - rectal"  = "#7CB342",  # light green
+    "High-risk - colon"  = "#8B0000",  # dark red
+    "High-risk - rectal" = "#E57373"   # light red/pink
+  )) +
+  labs(title = "Metacluster abundance by tumour site",
+       x = "Metacluster", y = "Mean abundance", fill = "Risk group / Site") +
+  theme_minimal(base_size = 13) +
+  theme(panel.grid.minor = element_blank(),
+        axis.line = element_line(color = "black"),
+        panel.border = element_blank())
+```
+```{r}
+tx_plot_df <- merged_df |>
+  select(treatment_status, all_of(top_mc)) |>
+  pivot_longer(cols = all_of(top_mc), names_to = "metacluster", values_to = "abundance") |>
+  mutate(mc_label = sub(".*_MC_([0-9]+)$", "MC_\\1", metacluster)) |>
+  filter(mc_label %in% names(risk_group_map), !is.na(treatment_status)) |>
+  mutate(risk_group = risk_group_map[mc_label],
+         mc_label = factor(mc_label, levels = c("MC_13", "MC_7", "MC_30", "MC_0", "MC_5", "MC_47")),
+         group_combo = paste(risk_group, treatment_status, sep = " - ")) |>
+  group_by(treatment_status, mc_label, risk_group, group_combo) |>
+  summarise(mean_abund = mean(abundance, na.rm = TRUE),
+            se = sd(abundance, na.rm = TRUE) / sqrt(n()),
+            .groups = "drop")
+
+ggplot(tx_plot_df, aes(x = mc_label, y = mean_abund, fill = group_combo)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7, color = "black") +
+  geom_errorbar(aes(ymin = mean_abund - se, ymax = mean_abund + se),
+                position = position_dodge(width = 0.8), width = 0.2) +
+  scale_fill_manual(values = c(
+    "Low-risk - Untreated"  = "#1B5E20",
+    "Low-risk - Treated"    = "#7CB342",
+    "High-risk - Untreated" = "#8B0000",
+    "High-risk - Treated"   = "#E57373"
+  )) +
+  labs(title = "Metacluster abundance by treatment status",
+       x = "Metacluster", y = "Mean abundance", fill = "Risk group / Treatment") +
+  theme_minimal(base_size = 13) +
+  theme(panel.grid.minor = element_blank(),
+        axis.line = element_line(color = "black"),
+        panel.border = element_blank())
+```
+```{r}
+library(dplyr)
+library(tidyr)
+library(knitr)
+library(dplyr)
+
+mc_subset <- names(risk_group_map)  # MC_13, MC_7, MC_30, MC_0, MC_5, MC_47
+mc_subset_cols <- top_mc[sub(".*_MC_([0-9]+)$", "MC_\\1", top_mc) %in% mc_subset]
+
+# --- Site Wilcoxon ---
+site_results_top <- lapply(mc_subset_cols, function(mc) {
+  test <- wilcox.test(merged_df[[mc]] ~ merged_df$site)
+  data.frame(metacluster = mc, p.value = test$p.value)
+}) |> bind_rows() |>
+  mutate(FDR = p.adjust(p.value, method = "BH")) |>
+  arrange(FDR)
+
+# --- Treatment Wilcoxon ---
+tx_results_top <- lapply(mc_subset_cols, function(mc) {
+  test <- wilcox.test(merged_df[[mc]] ~ merged_df$treatment_status)
+  data.frame(metacluster = mc, p.value = test$p.value)
+}) |> bind_rows() |>
+  mutate(FDR = p.adjust(p.value, method = "BH")) |>
+  arrange(FDR)
+
+site_results_top
+tx_results_top
+
+# --- Group means: site ---
+site_means <- merged_df |>
+  select(site, all_of(top_mc)) |>
+  pivot_longer(cols = all_of(top_mc), names_to = "metacluster", values_to = "abundance") |>
+  mutate(mc_label = sub(".*_MC_([0-9]+)$", "MC_\\1", metacluster)) |>
+  filter(mc_label %in% names(risk_group_map), !is.na(site)) |>
+  group_by(mc_label, site) |>
+  summarise(mean_abund = mean(abundance, na.rm = TRUE), .groups = "drop") |>
+  pivot_wider(names_from = site, values_from = mean_abund, names_prefix = "mean_")
+
+# --- Group means: treatment ---
+tx_means <- merged_df |>
+  select(treatment_status, all_of(top_mc)) |>
+  pivot_longer(cols = all_of(top_mc), names_to = "metacluster", values_to = "abundance") |>
+  mutate(mc_label = sub(".*_MC_([0-9]+)$", "MC_\\1", metacluster)) |>
+  filter(mc_label %in% names(risk_group_map), !is.na(treatment_status)) |>
+  group_by(mc_label, treatment_status) |>
+  summarise(mean_abund = mean(abundance, na.rm = TRUE), .groups = "drop") |>
+  pivot_wider(names_from = treatment_status, values_from = mean_abund, names_prefix = "mean_")
+
+# --- Wilcoxon results: site ---
+site_results_clean <- site_results_top |>
+  mutate(mc_label = sub(".*_MC_([0-9]+)$", "MC_\\1", metacluster),
+         risk_group = risk_group_map[mc_label]) |>
+  select(mc_label, risk_group, site_p = p.value, site_FDR = FDR)
+
+# --- Wilcoxon results: treatment ---
+tx_results_clean <- tx_results_top |>
+  mutate(mc_label = sub(".*_MC_([0-9]+)$", "MC_\\1", metacluster)) |>
+  select(mc_label, tx_p = p.value, tx_FDR = FDR)
+
+# --- Merge into one summary table ---
+summary_tbl <- site_results_clean |>
+  left_join(tx_results_clean, by = "mc_label") |>
+  left_join(site_means, by = "mc_label") |>
+  left_join(tx_means, by = "mc_label") |>
+  mutate(mc_label = factor(mc_label, levels = c("MC_13", "MC_7", "MC_30", "MC_0", "MC_5", "MC_47"))) |>
+  arrange(mc_label) |>
+  mutate(across(where(is.numeric), ~round(.x, 3)))
+
+summary_tbl
+
+# --- Render as table ---
+summary_tbl |>
+  kable(col.names = c("Metacluster", "Risk group",
+                       "p (site)", "FDR (site)",
+                       "p (treatment)", "FDR (treatment)",
+                       "Mean (colon)", "Mean (rectal)",
+                       "Mean (untreated)", "Mean (treated)"),
+        caption = "Metacluster abundance: site and treatment comparisons")
+
+summary_tbl |>
+  mutate(across(where(is.numeric), ~round(.x, 3))) |>
+  kable(col.names = c("Metacluster", "Risk group",
+                       "p (site)", "FDR (site)",
+                       "p (treatment)", "FDR (treatment)",
+                       "Mean (colon)", "Mean (rectal)",
+                       "Mean (untreated)", "Mean (treated)"),
+        caption = "Metacluster abundance: site and treatment comparisons")
+
+```
+```{r}
+clinical_df <-clin_risk
+clinical_df %>% 
+  filter(patient_id %in% c("G0114", "G0128", "G0136")) %>%
+  select(patient_id, cohort, sub_cohort, stage, detailed_stage, T_stage, N_stage, M_stage,
+         age, sex, differentiation, microsatellite_status, kras_status, braf_status,
+         cms_subtype, has_adjuvant_chemotherapy, adjuvant_chemotherapy_regimen,
+         has_neoadjuvant_chemoradiotherapy, dss_months, dss_event, risk_grp)
+```
+
+```{r}
+merged_df %>% 
+  filter(patient_id %in% c("G0114", "G0128", "G0136")) %>%
+  select(patient_id, matches("abundance_metacluster_leiden_1\\.0_MC_")) %>%
+  arrange(patient_id)
+```
+

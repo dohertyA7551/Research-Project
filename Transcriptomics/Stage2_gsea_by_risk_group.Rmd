@@ -1,0 +1,59 @@
+---
+title: "Stage 2 preranked GSEA by DFS risk group"
+output: html_notebook
+---
+
+Hallmark **fgsea** preranked GSEA on Stage 2 limma High vs Low DE results.
+
+**Input:** `analysis_output/stage2/Stage2_limma_high_vs_low_all_genes.csv` (gene-level logFC ranking).
+
+**Outputs:** `analysis_output/stage2/Stage2_fgsea_hallmark_*.csv` and dot plot.
+
+**R environment:** `/work_space/envs/transcriptomics2/bin/R` (fgsea, msigdbr).
+
+```{r setup}
+library(dplyr)
+library(readr)
+```
+
+```{r load-data}
+if (file.exists("analysis_output/stage2/Stage2_limma_high_vs_low_all_genes.csv")) {
+  base_dir <- "."
+} else if (file.exists("Transcriptomics/analysis_output/stage2/Stage2_limma_high_vs_low_all_genes.csv")) {
+  base_dir <- "Transcriptomics"
+} else {
+  stop("Knit from Transcriptomics/ or its parent directory.")
+}
+
+source(file.path(base_dir, "analysis_helpers.R"))
+source(file.path(base_dir, "gsea_helpers.R"))
+dirs <- setup_analysis_dirs(base_dir, "stage2")
+output_dir <- dirs$output_dir
+
+limma_csv <- file.path(output_dir, "Stage2_limma_high_vs_low_all_genes.csv")
+if (!file.exists(limma_csv)) {
+  stop("Run Stage2_limma_de_by_risk_group.Rmd first: ", limma_csv)
+}
+```
+
+```{r run-gsea}
+gsea_out <- run_gsea_from_limma_csv(
+  limma_csv    = limma_csv,
+  output_dir   = output_dir,
+  file_prefix  = "Stage2",
+  cohort_title = "Stage 2 Transcriptomics",
+  collections  = c("hallmark", "kegg")
+)
+
+sig_h <- gsea_out$hallmark %>% filter(padj < 0.05)
+cat("\nHallmark pathways FDR < 0.05:", nrow(sig_h), "\n")
+if (nrow(sig_h) > 0) {
+  print(sig_h %>% select(pathway, NES, pval, padj, size) %>% head(15))
+}
+
+sig_k <- gsea_out$kegg %>% filter(padj < 0.05)
+cat("\nKEGG pathways FDR < 0.05:", nrow(sig_k), "\n")
+if (nrow(sig_k) > 0) {
+  print(sig_k %>% select(pathway, NES, pval, padj, size) %>% head(15))
+}
+```

@@ -113,7 +113,7 @@ export_limma_figures(t$results, expr_mat, sample_meta, dirs$output_dir, "Taxonom
 
 cat("\nLimma DE complete.\n")
 
-# ---- Legacy (pooled: Stage2 + Retrospective + Colossus, quantile-normalized) ----
+## ---- Legacy (pooled: Stage2 + Retrospective + Colossus, quantile-normalized) ----
 common_genes <- Reduce(intersect, list(rownames(expr_mat_stage2), rownames(expr_mat_retro), rownames(expr_mat_colossus)))
 cat("\nCommon genes across Legacy cohorts:", length(common_genes), "\n")
 
@@ -135,14 +135,25 @@ legacy_meta <- bind_rows(
 legacy_meta <- legacy_meta[match(colnames(legacy_expr_qn), legacy_meta$sample_id), ]
 stopifnot(identical(legacy_meta$sample_id, colnames(legacy_expr_qn)))
 
-cat("\n=== Legacy (pooled) ===\n")
+cat("\n=== Legacy (pooled, all samples before NA-filtering) ===\n")
 print(table(legacy_meta$risk_grp, legacy_meta$cohort, useNA = "always"))
 
-legacy_meta$risk_grp <- factor(legacy_meta$risk_grp, levels = c("Low", "High"))
-legacy_meta$cohort <- factor(legacy_meta$cohort)
+# ---- NA-filter: keep only patients with a valid RSF risk_grp classification ----
+# model.matrix() silently drops NA rows, which desyncs design from legacy_expr_qn
+# (271 samples) and throws "row dimension of design doesn't match column dimension
+# of data object" in lmFit(). Subset both metadata and expression matrix first.
+legacy_meta_valid <- legacy_meta %>% filter(!is.na(risk_grp))
+legacy_expr_qn_valid <- legacy_expr_qn[, legacy_meta_valid$sample_id]
+stopifnot(identical(legacy_meta_valid$sample_id, colnames(legacy_expr_qn_valid)))
 
-design <- model.matrix(~ cohort + risk_grp, data = legacy_meta)
-fit <- lmFit(legacy_expr_qn, design)
+cat("\n=== Legacy (pooled, NA-filtered, n =", nrow(legacy_meta_valid), ") ===\n")
+print(table(legacy_meta_valid$risk_grp, legacy_meta_valid$cohort, useNA = "always"))
+
+legacy_meta_valid$risk_grp <- factor(legacy_meta_valid$risk_grp, levels = c("Low", "High"))
+legacy_meta_valid$cohort <- factor(legacy_meta_valid$cohort)
+
+design <- model.matrix(~ cohort + risk_grp, data = legacy_meta_valid)
+fit <- lmFit(legacy_expr_qn_valid, design)
 fit <- eBayes(fit)
 
 legacy_limma_results <- topTable(fit, coef = "risk_grpHigh", number = Inf, sort.by = "P")
@@ -154,10 +165,33 @@ write_csv(legacy_limma_results, file.path(dirs_legacy$output_dir, "Legacy_QN_lim
 cat("\n=== Legacy limma top results ===\n")
 print(head(legacy_limma_results))
 
+# ---- Sanity checks ----
+ncol(legacy_expr_qn_valid)          # should equal nrow(legacy_meta_valid), e.g. 89
+nrow(legacy_meta_valid)             # should equal ncol(legacy_expr_qn_valid)
+nrow(design)                        # should equal nrow(legacy_meta_valid)
+sum(is.na(legacy_meta_valid$risk_grp))  # should be 0
+sum(is.na(legacy_meta_valid$cohort))    # should be 0
 
-ncol(legacy_expr_qn)
-nrow(legacy_meta)
-nrow(design)
-sum(is.na(legacy_meta$risk_grp))
-sum(is.na(legacy_meta$cohort))
+# ---- Robust save: Legacy limma results (CSV + RDS + Rmd report) ----
 
+# Build an explicit, guaranteed-to-exist output directory
+legacy_output_dir <- file.path(p$base, "legacy_combined", "output")
+dir.create(legacy_output_dir, recursive = TRUE, showWarnings = FALSE)
+stopifnot(dir.exists(legacy_output_dir))  # fail loudly if this didn't work
+
+# Save full results as CSV
+csv_path <- file.path(legacy_output_dir, "Legacy_QN_limma_high_vs_low_all_genes.csv")
+write_csv(legacy_limma_results, csv_path)
+stopifnot(file.exists(csv_path))
+cat("Saved CSV to:", normalizePath(csv_path), "\n")
+
+# Also save as RDS (preserves exact R object, useful if you reload for figures later)
+rds_path <- file.path(legacy_output_dir, "Legacy_QN_limma_high_vs_low_all_genes.rds")
+saveRDS(legacy_limma_results, rds_path)
+cat("Saved RDS to:", normalizePath(rds_path), "\n")
+
+# Save top 5 up / top 5 down as a compact summary CSV too
+legacy_limma_results$abs_logFC <- abs(legacy_limma_results$logFC)
+top5_up <- legacy_limma_results %>% filter(logFC > 0) %>% arrange(adj.P.Val, desc(abs_logFC)) %>% head(5)
+top5_down <- legacy_limma_results %>% filter(logFC < 0) %>% arrange(adj.P.Val, desc(abs_logFC)) %>% head(5)
+write_csv(bind_rows(top5_up, top5_down), file.path(legacy_output_dir, "Legacy_limma_top5_up_down.csv"))

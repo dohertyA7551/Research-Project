@@ -1,0 +1,218 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+```{r}
+plot(cars)
+```
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Ctrl+Alt+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Ctrl+Shift+K* to preview the HTML file).
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(survival)
+library(coxphf)
+library(purrr)
+library(glmnet)
+library(readr)
+library(broom)
+library(survminer)
+library(stringr)
+library(tidyr)
+library(tibble)
+library(umap)
+library(limma)
+```
+```{r}
+merged_df <-readRDS(file ="RCSI_Taxonomy_clin_prot_merged_df.rds")
+```
+
+
+```{r}
+patients_P <-merged_df[grepl("^P", merged_df$patient_id), ]
+clin_b <-read_csv("/work_space/files/spatial/ColonRO1_2020_Taxonomy_clinical.csv")
+merged_df_dfs <- patients_P %>%
+  filter(
+    !is.na(dfs_months),
+    dfs_months > 0,
+    !is.na(dfs_event)
+  )
+length(merged_df_dfs$dfs_months)
+```
+```{r}
+# Get all leiden abundance columns
+leiden_cols <- colnames(merged_df)[grepl("abundance_metacluster_leiden", colnames(merged_df))]
+cat("Number of metacluster abundance columns:", length(leiden_cols), "\n")
+
+zero_mc <- sapply(merged_df_dfs[, leiden_cols], function(col) all(col == 0))
+zero_mc_names <- names(zero_mc[zero_mc])
+print(zero_mc_names)
+leiden_cols <-setdiff(leiden_cols ,zero_mc_names)
+print(leiden_cols)
+```
+```{r}
+cox_formula <- as.formula(
+  paste(
+    "Surv(dfs_months, dfs_event) ~",
+    paste(leiden_cols, collapse = " + ")
+  )
+)
+
+full_cox <- coxph(cox_formula, data = merged_df_dfs)
+summary(full_cox)
+```
+```{r}
+df_compare <- merged_df_dfs %>%
+  mutate(
+    dfs_group = factor(
+      dfs_event,
+      levels=c(0,1),
+      labels =c("No DFS event", "DFS event")
+    )
+  )
+
+
+table(df_compare$dfs_group, useNA = "ifany")
+# should show 97 No_DFS_event, 24 DFS_event (as you saw)
+
+
+
+mc_prob_stats <- map_dfr(leiden_cols, function(col) {
+  p <- df_compare[[col]]  # probabilities for this cluster
+
+  # Split by DFS group (note the spaces!)
+  p_event   <- p[df_compare$dfs_group == "DFS event"]
+  p_noevent <- p[df_compare$dfs_group == "No DFS event"]
+
+  # Remove NAs
+  p_event   <- p_event[!is.na(p_event)]
+  p_noevent <- p_noevent[!is.na(p_noevent)]
+
+  # If either group has no data, return NA row for this cluster
+  if (length(p_event) == 0 || length(p_noevent) == 0) {
+    return(tibble(
+      metacluster          = col,
+      mean_prob_event      = NA_real_,
+      mean_prob_noevent    = NA_real_,
+      median_prob_event    = NA_real_,
+      median_prob_noevent  = NA_real_,
+      p_value              = NA_real_
+    ))
+  }
+
+  # Non-parametric comparison of distributions
+  wt <- wilcox.test(p_event, p_noevent, exact = FALSE)
+
+  tibble(
+    metacluster          = col,
+    mean_prob_event      = mean(p_event),
+    mean_prob_noevent    = mean(p_noevent),
+    median_prob_event    = median(p_event),
+    median_prob_noevent  = median(p_noevent),
+    p_value              = wt$p.value
+  )
+})
+
+mc_prob_stats <- mc_prob_stats %>% arrange(p_value)
+mc_prob_stats
+```
+
+
+```{r}
+event_clusters <- mc_prob_stats %>%
+  filter(mean_prob_event > mean_prob_noevent) %>%
+  arrange(p_value)
+
+noevent_clusters <- mc_prob_stats %>%
+  filter(mean_prob_noevent > mean_prob_event) %>%
+  arrange(p_value)
+head(event_clusters)
+head(noevent_clusters)
+```
+```{r}
+event_clusters_sorted <-event_clusters[order(-event_clusters$mean_prob_event),]
+noevent_clusters_sorted <- noevent_clusters[order(-noevent_clusters$mean_prob_noevent),]
+print(event_clusters_sorted)
+print(noevent_clusters_sorted)
+```
+
+```{r}
+
+mc_ids_goodprog <-sub(".*(MC_\\d+).*","\\1", noevent_clusters_sorted$metacluster)
+mc_ids_poorprog <-sub(".*(MC_\\d+).*","\\1", event_clusters_sorted$metacluster)
+# vectors of column names that exist in df_compare
+bad_cols  <- event_clusters_sorted$metacluster
+good_cols <- noevent_clusters_sorted$metacluster
+
+# sanity check: ensure they are actually columns in df_compare
+stopifnot(all(bad_cols  %in% colnames(df_compare)))
+stopifnot(all(good_cols %in% colnames(df_compare)))
+```
+```{r}
+
+# per-patient total bad/good abundance
+bad_abund  <- rowSums(df_compare[, bad_cols,  drop = FALSE], na.rm = TRUE)
+good_abund <- rowSums(df_compare[, good_cols, drop = FALSE], na.rm = TRUE)
+
+patient_scores <- data.frame(
+  patient_id = rownames(df_compare),
+  good_abund = good_abund,
+  bad_abund  = bad_abund
+)
+
+# RAW prognosis score (no log)
+patient_scores$score_raw <- patient_scores$bad_abund - patient_scores$good_abund
+
+ggplot(patient_scores, aes(x = score_raw)) +
+  geom_histogram(bins = 30, colour = "black", fill = "steelblue") +
+  theme_minimal() +
+  labs(
+    x = "Raw prognosis score (bad - good MC abundance)",
+    y = "Number of patients"
+  )
+```
+```{r}
+eps <- 1e-6
+
+patient_scores$score_logratio <- log(patient_scores$bad_abund + eps) -
+                                 log(patient_scores$good_abund + eps)
+```
+
+```{r}
+RCSI_event_clusters <- readRDS("RCS_event_clusters.rds")
+RCSI_noevent_clusters <-readRDS("RCSI_no_event_clusters.rds")
+taxonomy_event_clusters_sorted <-event_clusters[order(-event_clusters$mean_prob_event),]
+taxonomy_noevent_clusters_sorted <- noevent_clusters[order(-noevent_clusters$mean_prob_noevent),]
+```
+
+
+
+```{r}
+mc_list_event_taxonomy <- taxonomy_event_clusters_sorted$metacluster
+mc_list_noevent_taxonomy <-taxonomy_event_clusters_sorted$metacluster
+
+mc_list_event_RCSI <-RCSI_event_clusters$metacluster
+mc_list_noevent_RCSI <-RCSI_noevent_clusters$metacluster
+
+
+mc_event_both <- intersect(mc_list_event_taxonomy, mc_list_event_RCSI)
+mc_event_both
+length(mc_event_both)
+
+mc_no_event_both <-intersect(mc_list_noevent_taxonomy, mc_list_noevent_RCSI)
+mc_no_event_both
+
+saveRDS(mc_event_both, file ="mc_event_both.rds")
+saveRDS(mc_no_event_both, file ="mc_noevent_both.rds")
+```
+
